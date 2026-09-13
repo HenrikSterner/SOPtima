@@ -139,6 +139,155 @@ def value_at(row: pd.Series, column: Any | None) -> str:
     return repair_text(row.get(column, "")) if column is not None else ""
 
 
+def parse_schedule_upload(uploaded: Any) -> dict[str, Any]:
+    """Læs en færdig vejlederliste til direkte generering af en tidsplan.
+
+    Formatet er én række pr. elev med kolonnerne Elev, Klasse, Lærer 1,
+    Fag 1, Lærer 2, Fag 2 og eventuelt bemærkninger fra lærerne. Lærerne
+    oprettes automatisk ud fra de navne/initialer, der står i arket.
+    """
+    table = read_uploaded_table(uploaded).dropna(how="all").copy()
+
+    def has_schedule_header(columns: list[Any]) -> bool:
+        keys = [normal_key(column) for column in columns]
+        has_student = any("elev" in key for key in keys)
+        has_class = any("klasse" in key or "hold" in key for key in keys)
+        teacher_and_subject_columns = sum(
+            "lærer" in key or "laerer" in key or "vejleder" in key or "fag" in key or "subject" in key
+            for key in keys
+        )
+        return has_student and has_class and teacher_and_subject_columns >= 4
+
+    def find_header_row(raw: pd.DataFrame) -> int | None:
+        for row_index, row in raw.head(25).iterrows():
+            if has_schedule_header([value for value in row.tolist() if repair_text(value)]):
+                return int(row_index)
+        return None
+
+    # Accepter også Excel-filer med titel/instruktioner før tabelhovedet eller
+    # et andet første ark, så længe et ark indeholder den angivne tabel.
+    if not has_schedule_header(list(table.columns)) and uploaded.name.casefold().endswith((".xlsx", ".xlsm")):
+        sheets = pd.read_excel(io.BytesIO(uploaded.getvalue()), sheet_name=None, header=None, dtype=object)
+        for raw in sheets.values():
+            header_row = find_header_row(raw)
+            if header_row is None:
+                continue
+            table = raw.iloc[header_row + 1 :].copy()
+            table.columns = [repair_text(value) or f"Kolonne {index + 1}" for index, value in enumerate(raw.iloc[header_row].tolist())]
+            table = table.dropna(how="all")
+            break
+    columns = list(table.columns)
+
+    def find_column(*alternatives: tuple[str, ...]) -> Any | None:
+        for patterns in alternatives:
+            found = column_for(columns, *patterns)
+            if found is not None:
+                return found
+        return None
+
+    name_col = find_column(("elev",), ("elevnavn",), ("navn",))
+    class_col = find_column(("klasse",), ("hold",))
+    teacher_columns = [
+        find_column(("lærer", "1"), ("laerer", "1"), ("vejleder", "1"), ("teacher", "1")),
+        find_column(("lærer", "2"), ("laerer", "2"), ("vejleder", "2"), ("teacher", "2")),
+    ]
+    subject_columns = [
+        find_column(("fag", "1"), ("subject", "1")),
+        find_column(("fag", "2"), ("subject", "2")),
+    ]
+    notes_col = (
+        find_column(("bemærk",), ("bemerk",), ("note",), ("kommentar",))
+        or find_column(("ændring",), ("aendring",))
+    )
+
+    if name_col is None or class_col is None or any(column is None for column in teacher_columns + subject_columns):
+        found_columns = ", ".join(repair_text(column) or "(tom)" for column in columns)
+        raise ValueError(
+            "Tidsplanarket skal indeholde kolonnerne Elev, Klasse, Lærer 1, Fag 1, "
+            "Lærer 2 og Fag 2. Kolonnen Bemærkninger/ændringer fra lærerne er valgfri. "
+            f"Fundne kolonner: {found_columns}."
+        )
+
+    students: list[dict[str, Any]] = []
+    teachers_by_id: dict[str, dict[str, Any]] = {}
+    assignments: list[list[str]] = []
+    invalid_rows: list[str] = []
+    for row_number, (_, row) in enumerate(table.iterrows(), 2):
+        name = value_at(row, name_col)
+        if not name:
+            continue
+        teacher_names = [value_at(row, column) for column in teacher_columns]
+        subjects = [value_at(row, column) for column in subject_columns]
+        if any(not value for value in teacher_names + subjects):
+            invalid_rows.append(str(row_number))
+            continue
+
+        teacher_ids = [normal_key(value) for value in teacher_names]
+        for teacher_id, teacher_name, subject in zip(teacher_ids, teacher_names, subjects):
+            teacher = teachers_by_id.setdefault(
+                teacher_id,
+                {"id": teacher_id, "name": teacher_name, "subjects": [], "holds": []},
+            )
+            if canonical_subject(subject) not in {canonical_subject(item) for item in teacher["subjects"]}:
+                teacher["subjects"].append(subject)
+
+        students.append(
+            {
+                "id": f"E{len(students) + 1:03d}",
+                "name": name,
+                "className": value_at(row, class_col),
+                "subjects": subjects,
+                "subjectsWithLevel": subjects[:],
+                "wishes": [],
+                "projectTitle": "",
+                "projectDescription": "",
+                "scheduleNotes": value_at(row, notes_col),
+            }
+        )
+        assignments.append(teacher_ids)
+
+    if invalid_rows:
+        rows = ", ".join(invalid_rows[:10])
+        suffix = " …" if len(invalid_rows) > 10 else ""
+        raise ValueError(f"Række(r) {rows}{suffix} mangler elevens to lærere eller fag.")
+    if not students:
+        raise ValueError("Der blev ikke fundet nogen komplette elever i tidsplanarket.")
+
+    teachers = sorted(teachers_by_id.values(), key=lambda item: item["name"].casefold())
+    loads = {teacher["id"]: 0 for teacher in teachers}
+    for assigned in assignments:
+        for teacher_id in set(assigned):
+            loads[teacher_id] += 1
+    return {
+        "students": students,
+        "teachers": teachers,
+        "solution": {"assignments": assignments, "loads": loads},
+        "source_name": getattr(uploaded, "name", "upload.xlsx"),
+    }
+
+
+def make_schedule_input_template() -> bytes:
+    """Lav et tomt Excel-ark med det forventede tidsplanformat."""
+    columns = [
+        "Elev",
+        "Klasse",
+        "Lærer 1",
+        "Fag 1",
+        "Lærer 2",
+        "Fag 2",
+        "",
+        "Bemærkninger/ændringer fra lærerne",
+    ]
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        pd.DataFrame(columns=columns).to_excel(writer, index=False, sheet_name="Tidsplan-input")
+        sheet = writer.book["Tidsplan-input"]
+        sheet.freeze_panes = "A2"
+        for index, width in enumerate((24, 12, 22, 22, 22, 22, 4, 45), 1):
+            sheet.column_dimensions[chr(64 + index)].width = width
+    return output.getvalue()
+
+
 def parse_students(table: pd.DataFrame) -> list[dict[str, Any]]:
     table = table.dropna(how="all").copy()
     columns = list(table.columns)
@@ -631,6 +780,9 @@ def make_schedule(
     pause_minutes: int,
     transition_minutes: int,
     group_pairs: bool,
+    lunch_mode: str = "Fast tidspunkt for alle lærere",
+    lunch_start_time: dt_time = dt_time(12, 0),
+    lunch_minutes: int = 30,
     search_attempts: int = 80,
     progress_callback: Any = None,
 ) -> dict[str, Any]:
@@ -641,6 +793,10 @@ def make_schedule(
         raise ValueError("Vejledningstiden pr. elev skal være mindst ét minut.")
     if pause_count < 0 or pause_minutes < 0 or transition_minutes < 0:
         raise ValueError("Pauser og skiftetid kan ikke være negative.")
+    if lunch_minutes < 1:
+        raise ValueError("Frokostpausen skal være mindst ét minut.")
+    if lunch_mode not in {"Fast tidspunkt for alle lærere", "Flydende for alle lærere"}:
+        raise ValueError("Vælg, om frokostpausen skal være fast eller flydende.")
     search_attempts = max(1, int(search_attempts))
     if progress_callback:
         progress_callback(0.0)
@@ -662,40 +818,108 @@ def make_schedule(
         for session in sessions:
             grouped.setdefault(session["pair"], []).append(session)
             first_index.setdefault(session["pair"], session["index"])
-        pairs = list(grouped)
-        rng = __import__("random").Random(20260913)
-        candidate_orders = [pairs]
-        candidate_orders.extend(rng.sample(pairs, len(pairs)) for _ in range(search_attempts - 1))
-        best_order = pairs
-        best_order_score = None
-        for order_index, candidate_order in enumerate(candidate_orders):
-            next_round: dict[str, int] = {}
-            starts = []
-            for pair in candidate_order:
-                block_start = max((next_round.get(teacher_id, 0) for teacher_id in pair), default=0)
-                starts.append(block_start)
-                for teacher_id in pair:
-                    next_round[teacher_id] = block_start + len(grouped[pair])
-            score = (max((starts[i] + len(grouped[pair]) for i, pair in enumerate(candidate_order)), default=0), sum(starts), tuple(first_index[pair] for pair in candidate_order))
-            if best_order_score is None or score < best_order_score:
-                best_order = candidate_order
-                best_order_score = score
-            if progress_callback:
-                progress_callback(0.65 * (order_index + 1) / len(candidate_orders))
-        pair_order = best_order
+        pair_order = sorted(grouped, key=lambda pair: first_index[pair])
         ordered_sessions = [session for pair in pair_order for session in grouped[pair]]
     else:
-        ordered_sessions = sessions
-        if progress_callback:
-            progress_callback(0.65)
+        ordered_sessions = sessions[:]
 
-    # Hver lærer er en ressource. Elever med forskellige lærerpar kan derfor
-    # ligge samtidig, mens et lærerpar aldrig får overlappende elever.
-    teacher_next_round: dict[str, int] = {}
-    for session in ordered_sessions:
-        session["round"] = max((teacher_next_round.get(teacher_id, 0) for teacher_id in session["pair"]), default=0)
+    # Tildel runder som en kantfarvning: to vejledninger kan være samtidige,
+    # når de ikke deler en lærer. Den tidligere rækkefølge-baserede løsning
+    # kunne lægge uafhængige lærerpar efter hinanden og dermed næsten fordoble
+    # dagens længde. DSATUR finder i stedet parallelle runder med færrest
+    # mulige konflikter og stopper straks, når lærerbelastningens nedre grænse
+    # er nået.
+    teacher_sessions: dict[str, list[int]] = defaultdict(list)
+    for session_index, session in enumerate(ordered_sessions):
         for teacher_id in session["pair"]:
-            teacher_next_round[teacher_id] = session["round"] + 1
+            teacher_sessions[teacher_id].append(session_index)
+    conflicts: list[set[int]] = [set() for _ in ordered_sessions]
+    for session_indexes in teacher_sessions.values():
+        for session_index in session_indexes:
+            conflicts[session_index].update(other for other in session_indexes if other != session_index)
+    degrees = [len(conflict_set) for conflict_set in conflicts]
+    lower_bound = max(len(session_indexes) for session_indexes in teacher_sessions.values())
+    best_colors: list[int] | None = None
+    best_colour_count = len(ordered_sessions) + 1
+    coloring_attempts = max(1, search_attempts)
+    for attempt_index in range(coloring_attempts):
+        rng = __import__("random").Random(20260913 + attempt_index)
+        colors = [-1] * len(ordered_sessions)
+        saturation: list[set[int]] = [set() for _ in ordered_sessions]
+        uncoloured = set(range(len(ordered_sessions)))
+        while uncoloured:
+            max_saturation = max(len(saturation[index]) for index in uncoloured)
+            candidates = [index for index in uncoloured if len(saturation[index]) == max_saturation]
+            max_degree = max(degrees[index] for index in candidates)
+            candidates = [index for index in candidates if degrees[index] == max_degree]
+            session_index = rng.choice(candidates)
+            used_colours = {colors[other] for other in conflicts[session_index] if colors[other] >= 0}
+            colour = 0
+            while colour in used_colours:
+                colour += 1
+            colors[session_index] = colour
+            uncoloured.remove(session_index)
+            for other in conflicts[session_index]:
+                if other in uncoloured:
+                    saturation[other].add(colour)
+        colour_count = max(colors) + 1
+        if colour_count < best_colour_count:
+            best_colors = colors
+            best_colour_count = colour_count
+        if progress_callback:
+            progress_callback(0.1 + 0.8 * (attempt_index + 1) / coloring_attempts)
+        if best_colour_count <= lower_bound:
+            break
+
+    # En ombytning af hele runder ændrer ikke lærer-konflikterne. Når
+    # lærerpar-optimering er valgt, bruges det derfor som et sekundært mål:
+    # runder med de samme lærerpar placeres så vidt muligt ved siden af
+    # hinanden, uden at antallet af runder eller paralleliteten ændres.
+    round_order = list(range(best_colour_count))
+    if group_pairs and best_colors is not None and best_colour_count > 1:
+        pairs_in_round = [set() for _ in range(best_colour_count)]
+        for session, colour in zip(ordered_sessions, best_colors):
+            pairs_in_round[colour].add(session["pair"])
+        affinity = [
+            [len(pairs_in_round[left] & pairs_in_round[right]) for right in range(best_colour_count)]
+            for left in range(best_colour_count)
+        ]
+
+        def order_score(order: list[int]) -> int:
+            return sum(affinity[left][right] for left, right in zip(order, order[1:]))
+
+        best_order = round_order
+        best_order_score = -1
+        for start in round_order:
+            candidate_order = [start]
+            remaining = set(round_order)
+            remaining.remove(start)
+            while remaining:
+                previous = candidate_order[-1]
+                best_affinity = max(affinity[previous][candidate] for candidate in remaining)
+                next_round = min(candidate for candidate in remaining if affinity[previous][candidate] == best_affinity)
+                candidate_order.append(next_round)
+                remaining.remove(next_round)
+            candidate_score = order_score(candidate_order)
+            if candidate_score > best_order_score:
+                best_order = candidate_order
+                best_order_score = candidate_score
+        improved = True
+        while improved:
+            improved = False
+            for left in range(len(best_order) - 1):
+                for right in range(left + 1, len(best_order)):
+                    candidate_order = best_order[:]
+                    candidate_order[left], candidate_order[right] = candidate_order[right], candidate_order[left]
+                    if order_score(candidate_order) > best_order_score:
+                        best_order = candidate_order
+                        best_order_score = order_score(candidate_order)
+                        improved = True
+        round_order = best_order
+
+    colour_to_round = {colour: round_index for round_index, colour in enumerate(round_order)}
+    for session, colour in zip(ordered_sessions, best_colors or []):
+        session["round"] = colour_to_round[colour]
     last_round = max(session["round"] for session in ordered_sessions)
     actual_pause_count = min(pause_count, last_round)
     pause_after = {
@@ -707,10 +931,40 @@ def make_schedule(
 
     plan_start = datetime.combine(date.today(), start_time)
     day_end = datetime.combine(date.today(), end_time)
+    lunch_start_dt = datetime.combine(date.today(), lunch_start_time)
+    lunch_end_dt = lunch_start_dt + timedelta(minutes=lunch_minutes)
+    if lunch_mode == "Fast tidspunkt for alle lærere" and (lunch_start_dt < plan_start or lunch_end_dt > day_end):
+        raise ValueError("Den faste frokostpause skal ligge inden for tidsrummet og kunne rumme hele pausen.")
+    floating_lunch_round = max(1, (last_round + 1) // 2)
+    lunch_interval: tuple[datetime, datetime] | None = None
+    lunch_added = False
     round_starts = []
     timeline_rows = []
     cursor = plan_start
     for round_number in range(last_round + 1):
+        if not lunch_added:
+            if lunch_mode == "Flydende for alle lærere":
+                add_lunch = round_number == floating_lunch_round
+            else:
+                current_round_end = cursor + timedelta(minutes=student_minutes)
+                add_lunch = cursor >= lunch_start_dt or current_round_end > lunch_start_dt
+            if add_lunch:
+                if lunch_mode == "Fast tidspunkt for alle lærere":
+                    if cursor < lunch_start_dt:
+                        cursor = lunch_start_dt
+                    pause_start = lunch_start_dt
+                    pause_end = lunch_end_dt
+                else:
+                    pause_start = cursor
+                    pause_end = cursor + timedelta(minutes=lunch_minutes)
+                lunch_interval = (pause_start, pause_end)
+                timeline_rows.append({
+                    "_sort": (round_number, -1), "Type": "Frokostpause", "Start": _clock_label(pause_start),
+                    "Slut": _clock_label(pause_end), "Varighed (min.)": lunch_minutes, "Elev": "", "Klasse": "",
+                    "Lærer(e)": "Alle lærere", "Information": "Frokostpause", "Bemærkning": "",
+                })
+                cursor = pause_end
+                lunch_added = True
         round_starts.append(cursor)
         round_end = cursor + timedelta(minutes=student_minutes)
         if round_number < last_round:
@@ -720,16 +974,60 @@ def make_schedule(
                 timeline_rows.append({
                     "_sort": (round_number, 1), "Type": "Pause", "Start": _clock_label(next_start),
                     "Slut": _clock_label(pause_end), "Varighed (min.)": pause_minutes, "Elev": "", "Klasse": "",
-                    "Lærer(e)": "", "Information": "Pause",
+                    "Lærer(e)": "", "Information": "Pause", "Bemærkning": "",
                 })
                 next_start = pause_end
             cursor = next_start
         else:
             cursor = round_end
+    if not lunch_added and lunch_mode == "Fast tidspunkt for alle lærere":
+        lunch_interval = (lunch_start_dt, lunch_end_dt)
+        timeline_rows.append({
+            "_sort": (last_round + 1, -1), "Type": "Frokostpause", "Start": _clock_label(lunch_start_dt),
+            "Slut": _clock_label(lunch_end_dt), "Varighed (min.)": lunch_minutes, "Elev": "", "Klasse": "",
+            "Lærer(e)": "Alle lærere", "Information": "Frokostpause", "Bemærkning": "",
+        })
+        cursor = max(cursor, lunch_end_dt)
     if cursor > day_end:
         required = int((cursor - plan_start).total_seconds() // 60)
         available = int((day_end - plan_start).total_seconds() // 60)
-        raise ValueError(f"Tidsplanen kræver mindst {required} minutter, men tidsrummet rummer kun {available} minutter.")
+        rounds = last_round + 1
+        guidance_total = rounds * student_minutes
+        transition_total = last_round * transition_minutes
+        regular_pause_total = actual_pause_count * pause_minutes
+        lunch_total = lunch_minutes if lunch_interval is not None else 0
+        accounted_total = guidance_total + transition_total + regular_pause_total + lunch_total
+        fixed_time_adjustment = max(0, required - accounted_total)
+        teacher_loads = Counter(
+            teacher_id
+            for session in sessions
+            for teacher_id in session["pair"]
+        )
+        busiest = sorted(teacher_loads.items(), key=lambda item: (-item[1], item[0]))[:3]
+        busiest_text = ", ".join(
+            f"{teacher_label(teacher_id, teacher_map)} ({load} elev.)"
+            for teacher_id, load in busiest
+        )
+        minimum_end = _clock_label(plan_start + timedelta(minutes=required))
+        explanation = [
+            f"{len(sessions)} elever er fordelt på {rounds} vejledningsrunder, fordi den samme lærer ikke kan vejlede to elever samtidig.",
+            f"Selve vejledningerne bruger {rounds} × {student_minutes} minutter = {guidance_total} minutter.",
+            f"Skift mellem runder bruger {last_round} × {transition_minutes} minutter = {transition_total} minutter.",
+            f"De almindelige pauser bruger {actual_pause_count} × {pause_minutes} minutter = {regular_pause_total} minutter.",
+            f"Frokostpausen bruger {lunch_total} minutter og er sat til {lunch_mode.casefold()}.",
+            f"De mest belastede lærere er {busiest_text}.",
+        ]
+        if fixed_time_adjustment:
+            explanation.append(
+                f"Den faste frokosttid giver desuden {fixed_time_adjustment} minutters nødvendig tidsjustering, så ingen vejledning ligger i frokostpausen."
+            )
+        raise ValueError(
+            f"Tidsplanen kan ikke afsluttes kl. {_clock_label(day_end)}. "
+            f"Med de valgte indstillinger skal den mindst afsluttes kl. {minimum_end}; "
+            f"tidsrummet fra kl. {_clock_label(plan_start)} til kl. {_clock_label(day_end)} er kun {available} minutter.\n\n"
+            + "\n".join(f"• {line}" for line in explanation)
+            + f"\n\nDer mangler derfor {required - available} minutter. Forlæng sluttiden eller reducer elevtid, skiftetid eller almindelige pauser."
+        )
 
     session_rows = []
     teacher_rows = []
@@ -749,12 +1047,14 @@ def make_schedule(
             "Vejleder 1": teacher_label(assigned[0], teacher_map), "Fag 2": student["subjects"][1],
             "Vejleder 2": teacher_label(assigned[1], teacher_map), "Lærerpar": pair_label,
             "Projekttitel": student.get("projectTitle", ""),
+            "Bemærkninger/ændringer fra lærerne": student.get("scheduleNotes", ""),
         })
         timeline_rows.append({
             "_sort": (session["round"], 0), "Type": "Vejledning", "Start": _clock_label(session_start),
             "Slut": _clock_label(session_end), "Varighed (min.)": student_minutes, "Elev": student["name"],
             "Klasse": student.get("className", ""), "Lærer(e)": pair_label,
             "Information": student.get("projectTitle", "") or "SOP-vejledning",
+            "Bemærkning": student.get("scheduleNotes", ""),
         })
         pair_counts[pair] += 1
         pair_first_last.setdefault(pair, [time_label, time_label])
@@ -763,11 +1063,22 @@ def make_schedule(
             subject_slots = [subject for slot, subject in enumerate(student["subjects"][:2]) if assigned[slot] == teacher_id]
             co_teachers = list(dict.fromkeys(other_id for other_id in assigned if other_id != teacher_id))
             teacher_rows.append({
+                "Type": "Vejledning",
                 "Start": _clock_label(session_start), "Slut": _clock_label(session_end), "Tid": time_label,
                 "Lærer": teacher_label(teacher_id, teacher_map), "Initialer": teacher_id, "Elev": student["name"],
                 "Klasse": student.get("className", ""), "Fag": " · ".join(dict.fromkeys(subject_slots)),
                 "Medvejleder": " + ".join(teacher_label(other_id, teacher_map) for other_id in co_teachers) or "—",
                 "Projekttitel": student.get("projectTitle", ""),
+                "Bemærkning": student.get("scheduleNotes", ""),
+            })
+    if lunch_interval is not None:
+        pause_start, pause_end = lunch_interval
+        for teacher in teachers:
+            teacher_rows.append({
+                "Type": "Frokostpause", "Start": _clock_label(pause_start), "Slut": _clock_label(pause_end),
+                "Tid": f"{_clock_label(pause_start)}–{_clock_label(pause_end)}", "Lærer": teacher_label(teacher["id"], teacher_map),
+                "Initialer": teacher["id"], "Elev": "", "Klasse": "", "Fag": "Frokostpause",
+                "Medvejleder": "—", "Projekttitel": "", "Bemærkning": "Fælles frokostpause",
             })
     timeline_rows.sort(key=lambda row: row["_sort"])
     for row in timeline_rows:
@@ -775,9 +1086,9 @@ def make_schedule(
     session_rows.sort(key=lambda row: row["Start"])
     teacher_rows.sort(key=lambda row: (row["Start"], row["Lærer"]))
 
-    student_columns = ["Start", "Slut", "Tid", "Elev", "Klasse", "Fag 1", "Vejleder 1", "Fag 2", "Vejleder 2", "Lærerpar", "Projekttitel"]
-    teacher_columns = ["Start", "Slut", "Tid", "Lærer", "Initialer", "Elev", "Klasse", "Fag", "Medvejleder", "Projekttitel"]
-    timeline_columns = ["Type", "Start", "Slut", "Varighed (min.)", "Elev", "Klasse", "Lærer(e)", "Information"]
+    student_columns = ["Start", "Slut", "Tid", "Elev", "Klasse", "Fag 1", "Vejleder 1", "Fag 2", "Vejleder 2", "Lærerpar", "Projekttitel", "Bemærkninger/ændringer fra lærerne"]
+    teacher_columns = ["Type", "Start", "Slut", "Tid", "Lærer", "Initialer", "Elev", "Klasse", "Fag", "Medvejleder", "Projekttitel", "Bemærkning"]
+    timeline_columns = ["Type", "Start", "Slut", "Varighed (min.)", "Elev", "Klasse", "Lærer(e)", "Information", "Bemærkning"]
     pair_rows = [
         {"Lærerpar": _schedule_pair_label(pair, teacher_map), "Antal elever": count, "Tidsblok": " → ".join(pair_first_last[pair])}
         for pair, count in sorted(pair_counts.items(), key=lambda item: pair_first_last[item[0]][0])
@@ -797,6 +1108,9 @@ def make_schedule(
             "Antal pauser": actual_pause_count,
             "Minutter pr. pause": pause_minutes,
             "Minutter mellem elever": transition_minutes,
+            "Frokostpause (min.)": lunch_minutes,
+            "Frokostpause": lunch_mode,
+            "Fast frokosttid": _clock_label(lunch_start_dt) if lunch_mode == "Fast tidspunkt for alle lærere" else "Flydende",
             "Lærerpar samlet": "Ja" if group_pairs else "Nej",
             "Optimeringsdybde": search_attempts,
             "Planlagt tidsforbrug (min.)": total_minutes,
@@ -842,9 +1156,10 @@ def make_teacher_gantt_html(schedule: dict[str, Any], selected_teacher: str | No
         for _, row in teacher_rows.iterrows():
             start = clock_minutes(row["Start"])
             end = clock_minutes(row["Slut"])
-            subject = str(row.get("Fag", "Vejledning"))
-            student = str(row.get("Elev", "Elev"))
-            color = palette[sum(ord(char) for char in subject) % len(palette)]
+            is_lunch = str(row.get("Type", "")) == "Frokostpause"
+            subject = "Frokostpause" if is_lunch else str(row.get("Fag", "Vejledning"))
+            student = "Frokostpause" if is_lunch else str(row.get("Elev", "Elev"))
+            color = "#71858a" if is_lunch else palette[sum(ord(char) for char in subject) % len(palette)]
             tooltip = html.escape(f"{row['Start']}–{row['Slut']} · {student} · {subject}", quote=True)
             blocks.append(
                 f'<div class="gantt-block" title="{tooltip}" style="left:{position(start):.3f}%;width:{max(0.8, position(end) - position(start)):.3f}%;background:{color}">'
@@ -2493,11 +2808,57 @@ def main_v2() -> None:
 
     if active_step == "6 · Tidsplan":
         st.title("6 · Tidsplan for vejledning")
+        st.subheader("Upload godkendt lærer- og elevliste")
+        st.caption("Upload den færdige liste med én række pr. elev. Listen bruges direkte — du behøver ikke først indlæse eller beregne en fordeling i trin 1-5.")
+        schedule_upload = st.file_uploader(
+            "Godkendt liste (.xlsx eller .xlsm)",
+            type=["xlsx", "xlsm"],
+            key="v2_schedule_upload",
+            help="Påkrævede kolonner: Elev, Klasse, Lærer 1, Fag 1, Lærer 2 og Fag 2.",
+        )
+        template_columns = st.columns([1, 2])
+        with template_columns[0]:
+            schedule_template = try_excel_export(make_schedule_input_template)
+            if schedule_template is not None:
+                st.download_button(
+                    "Download Excel-skabelon",
+                    data=schedule_template,
+                    file_name="tidsplan_input.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="v2_download_schedule_template",
+                )
+        with template_columns[1]:
+            st.caption("Den sidste kolonne kan bruges til bemærkninger eller ændringer fra lærerne. Den tomme kolonne i eksemplet er valgfri.")
+
+        uploaded_schedule = None
+        if schedule_upload is not None:
+            try:
+                uploaded_schedule = parse_schedule_upload(schedule_upload)
+                st.success(
+                    f"Excel klar: {len(uploaded_schedule['students'])} elever og "
+                    f"{len(uploaded_schedule['teachers'])} lærere fundet."
+                )
+            except (ValueError, ImportError) as error:
+                st.error(str(error))
+
         solution = st.session_state.get("solution")
-        if solution is None:
-            st.info("Beregn først en fordeling i fanen Beregn.")
+        if uploaded_schedule is not None:
+            schedule_students_source = uploaded_schedule["students"]
+            schedule_teachers_source = uploaded_schedule["teachers"]
+            schedule_solution_source = uploaded_schedule["solution"]
+            st.success(
+                f"Godkendt liste klar: {len(uploaded_schedule['students'])} elever og "
+                f"{len(uploaded_schedule['teachers'])} lærere. Vælg tider, varighed og pauser nedenfor."
+            )
+        elif solution is None:
+            st.info("Upload en godkendt liste her, eller beregn først en fordeling i fanen Beregn.")
         else:
+            schedule_students_source = students
+            schedule_teachers_source = teachers
+            schedule_solution_source = solution
             st.caption("Hver elev får én samlet vejledningstid med sine tildelte vejledere. Brug Elevplanen som elevens opslag og Lærerplanen som lærerens dagsorden.")
+
+        if uploaded_schedule is not None or solution is not None:
             time_columns = st.columns(4)
             with time_columns[0]:
                 schedule_start = st.time_input("Starttidspunkt", value=dt_time(9, 0), key="v2_schedule_start")
@@ -2514,6 +2875,25 @@ def main_v2() -> None:
                 schedule_pause_minutes = st.number_input("Minutter pr. pause", min_value=0, max_value=120, value=15, step=5, key="v2_schedule_pause_minutes")
             with pause_columns[2]:
                 schedule_group_pairs = st.checkbox("Saml samme lærerpar mest muligt", value=True, key="v2_schedule_group_pairs", help="Elever med samme lærerpar lægges i sammenhængende blokke, så lærerne skifter færre gange.")
+            lunch_columns = st.columns(3)
+            with lunch_columns[0]:
+                schedule_lunch_minutes = st.number_input(
+                    "Frokostpause (minutter)", min_value=1, max_value=120, value=30, step=5,
+                    key="v2_schedule_lunch_minutes",
+                )
+            with lunch_columns[1]:
+                schedule_lunch_mode = st.selectbox(
+                    "Frokostpause for lærerne",
+                    ["Fast tidspunkt for alle lærere", "Flydende for alle lærere"],
+                    key="v2_schedule_lunch_mode",
+                    help="Fast betyder samme klokkeslæt for alle. Flydende placerer pausen midt i den samlede vejledningsplan.",
+                )
+            with lunch_columns[2]:
+                if schedule_lunch_mode == "Fast tidspunkt for alle lærere":
+                    schedule_lunch_start = st.time_input("Fast frokosttid", value=dt_time(12, 0), key="v2_schedule_lunch_start")
+                else:
+                    schedule_lunch_start = dt_time(12, 0)
+                    st.caption("Flydende: placeres automatisk midt i planen.")
             schedule_depth = st.slider(
                 "Algoritmedybde for tidsplan",
                 10,
@@ -2521,15 +2901,15 @@ def main_v2() -> None:
                 80,
                 10,
                 key="v2_schedule_depth",
-                help="Algoritmen afprøver så mange forskellige rækkefølger af lærerpar. En højere værdi kan samle lærerpar bedre, men tager længere tid. Indstillingen har størst effekt, når 'Saml samme lærerpar mest muligt' er slået til.",
+                help="Algoritmen afprøver forskellige måder at placere uafhængige lærerpar parallelt. En højere værdi kan give færre vejledningsrunder, men tager længere tid.",
             )
-            if st.button("Lav eller opdater tidsplan", type="primary", key="v2_make_schedule"):
+            if st.button("Generér tidsplan" if uploaded_schedule is not None else "Lav eller opdater tidsplan", type="primary", key="v2_make_schedule"):
                 try:
                     progress_bar = st.progress(0.0, text="Beregner tidsplan: 0 %")
                     st.session_state["v2_schedule"] = make_schedule(
-                        students,
-                        teachers,
-                        solution,
+                        schedule_students_source,
+                        schedule_teachers_source,
+                        schedule_solution_source,
                         schedule_start,
                         schedule_end,
                         int(schedule_student_minutes),
@@ -2537,11 +2917,14 @@ def main_v2() -> None:
                         int(schedule_pause_minutes),
                         int(schedule_transition_minutes),
                         schedule_group_pairs,
+                        lunch_mode=schedule_lunch_mode,
+                        lunch_start_time=schedule_lunch_start,
+                        lunch_minutes=int(schedule_lunch_minutes),
                         search_attempts=int(schedule_depth),
                         progress_callback=lambda value: update_algorithm_progress(progress_bar, "Beregner tidsplan", value),
                     )
                     update_algorithm_progress(progress_bar, "Tidsplan færdig", 1.0)
-                    st.success("Tidsplanen er opdateret.")
+                    st.success("Tidsplanen er genereret fra Excel-filen." if uploaded_schedule is not None else "Tidsplanen er opdateret.")
                 except ValueError as error:
                     st.session_state["v2_schedule"] = None
                     st.error(str(error))
