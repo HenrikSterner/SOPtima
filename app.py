@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import html
+import hashlib
 import json
 import re
 import unicodedata
@@ -22,17 +23,20 @@ DEFAULT_TEMPLATE = ROOT / "SOP - SKABELON.docx"
 TEST_STUDENTS_FILE = ROOT / "testdata" / "sop_test_elever.csv"
 TEST_TEACHERS_FILE = ROOT / "testdata" / "sop_test_lærere.csv"
 NO_WISHES_LABEL = "Ingen ønsker"
+UNASSIGNED_LABEL = "Ingen vejleder"
 
 
 def repair_text(value: Any) -> str:
     """Gør også ældre filer med dobbeltkodet UTF-8 læsbare."""
     text = "" if value is None else str(value).strip()
-    if text.casefold() in {"nan", "nat", "none"}:
+    if text.casefold() in {"nan", "nat", "none", "<na>"}:
         return ""
     if any(marker in text for marker in ("Ã", "Â", "�")):
         try:
             fixed = text.encode("latin1").decode("utf-8")
-            if fixed.count("�") < text.count("�"):
+            before_markers = sum(text.count(marker) for marker in ("Ã", "Â", "�"))
+            after_markers = sum(fixed.count(marker) for marker in ("Ã", "Â", "�"))
+            if after_markers < before_markers:
                 return fixed
         except (UnicodeEncodeError, UnicodeDecodeError):
             pass
@@ -67,6 +71,59 @@ def canonical_subject(value: Any) -> str:
         .replace("Ã¸", "oe")
         .replace("Ã¥", "aa")
     )
+
+
+def parse_capacity(value: Any, *, default: int = 0, maximum: int = 50) -> int:
+    """Læs et max-tal uden at acceptere tvetydige eller negative værdier."""
+    text = repair_text(value)
+    if not text:
+        return default
+    match = re.fullmatch(r"\s*(\d+)(?:\.0+)?\s*(?:elever?|opgaver?)?\s*", text, flags=re.I)
+    if not match:
+        raise ValueError(f"Max-værdien '{text}' skal være et helt tal mellem 0 og {maximum}.")
+    capacity = int(match.group(1))
+    if capacity > maximum:
+        raise ValueError(f"Max-værdien {capacity} er større end den tilladte grænse på {maximum}.")
+    return capacity
+
+
+def unique_wishes(student: dict[str, Any]) -> list[str]:
+    """Returnér højst to forskellige, normaliserede lærerønsker."""
+    return list(dict.fromkeys(normal_key(wish) for wish in student.get("wishes", []) if normal_key(wish)))[:2]
+
+
+def wish_status(student: dict[str, Any], assigned: list[str | None]) -> tuple[int, int]:
+    """Returnér antal opfyldte og antal afgivne, forskellige ønsker."""
+    wishes = unique_wishes(student)
+    fulfilled = len(set(wishes) & {normal_key(item) for item in assigned if item})
+    return fulfilled, len(wishes)
+
+
+def wish_status_label(student: dict[str, Any], assigned: list[str | None]) -> str:
+    fulfilled, total = wish_status(student, assigned)
+    return "Ingen angivet" if total == 0 else f"{fulfilled}/{total}"
+
+
+def safe_spreadsheet_value(value: Any) -> Any:
+    """Neutralisér tekst, som ellers kan blive fortolket som en regnearksformel."""
+    if isinstance(value, str) and re.match(r"^\s*[=+\-@]", value):
+        return "'" + value
+    return value
+
+
+def safe_excel_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    return frame.map(safe_spreadsheet_value)
+
+
+def teacher_identity(value: Any) -> tuple[str, str]:
+    """Læs både initialer og etiketten 'Navn (initialer)' fra en tidsplanfil."""
+    label = repair_text(value)
+    match = re.search(r"\(([^()]+)\)\s*$", label)
+    if match:
+        teacher_id = normal_key(match.group(1))
+        name = repair_text(label[: match.start()]) or teacher_id
+        return teacher_id, name
+    return normal_key(label), label
 
 
 def extract_embedded(name: str, terminator: str) -> Any:
@@ -222,12 +279,15 @@ def parse_schedule_upload(uploaded: Any) -> dict[str, Any]:
             invalid_rows.append(str(row_number))
             continue
 
-        teacher_ids = [normal_key(value) for value in teacher_names]
-        for teacher_id, teacher_name, subject in zip(teacher_ids, teacher_names, subjects):
+        teacher_identities = [teacher_identity(value) for value in teacher_names]
+        teacher_ids = [item[0] for item in teacher_identities]
+        for (teacher_id, teacher_name), subject in zip(teacher_identities, subjects):
             teacher = teachers_by_id.setdefault(
                 teacher_id,
                 {"id": teacher_id, "name": teacher_name, "subjects": [], "holds": []},
             )
+            if normal_key(teacher.get("name")) == teacher_id and normal_key(teacher_name) != teacher_id:
+                teacher["name"] = teacher_name
             if canonical_subject(subject) not in {canonical_subject(item) for item in teacher["subjects"]}:
                 teacher["subjects"].append(subject)
 
@@ -280,7 +340,7 @@ def make_schedule_input_template() -> bytes:
     ]
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        pd.DataFrame(columns=columns).to_excel(writer, index=False, sheet_name="Tidsplan-input")
+        safe_excel_frame(pd.DataFrame(columns=columns)).to_excel(writer, index=False, sheet_name="Tidsplan-input")
         sheet = writer.book["Tidsplan-input"]
         sheet.freeze_panes = "A2"
         for index, width in enumerate((24, 12, 22, 22, 22, 22, 4, 45), 1):
@@ -308,15 +368,21 @@ def parse_students(table: pd.DataFrame) -> list[dict[str, Any]]:
             or column_for(columns, "wish", str(index))
         )
     if name_col is None or any(item is None for item in subject_cols):
-        raise ValueError("Elevarket skal indeholde kolonnerne Navn, Klasse, Fag 1 og Fag 2.")
+        raise ValueError("Elevarket skal indeholde kolonnerne Elevnavn/Navn, Fag 1 og Fag 2. Klasse/Hold anbefales, men er valgfri.")
 
     title_col = column_for(columns, "projekttitel") or column_for(columns, "projekt", "titel") or column_for(columns, "projecttitle") or column_for(columns, "projektnavn")
     description_col = column_for(columns, "projektbeskrivelse") or column_for(columns, "projekt", "beskrivelse") or column_for(columns, "projectdescription") or column_for(columns, "beskrivelse") or column_for(columns, "description")
     students = []
+    invalid_rows = []
     for row_number, (_, row) in enumerate(table.iterrows(), 1):
         name = value_at(row, name_col)
         subjects = [value_at(row, column) for column in subject_cols]
-        if not name or not any(subjects):
+        row_has_data = any(repair_text(value) for value in row.tolist())
+        if row_has_data and not name:
+            invalid_rows.append(f"række {row_number} mangler elevnavn")
+            continue
+        if name and not any(subjects):
+            invalid_rows.append(f"{name} mangler begge fag")
             continue
         wishes = [normal_key(value_at(row, column)) for column in wish_cols]
         students.append(
@@ -331,6 +397,9 @@ def parse_students(table: pd.DataFrame) -> list[dict[str, Any]]:
                 "projectDescription": value_at(row, description_col),
             }
         )
+    if invalid_rows:
+        suffix = " …" if len(invalid_rows) > 10 else ""
+        raise ValueError("Elevarket indeholder ugyldige rækker: " + "; ".join(invalid_rows[:10]) + suffix + ".")
     if not students:
         raise ValueError("Der blev ikke fundet nogen elever i elevarket.")
     return students
@@ -369,14 +438,19 @@ def parse_teachers(table: pd.DataFrame, technical: dict[str, str] | None = None)
     teachers_by_id: dict[str, dict[str, Any]] = {}
     capacities: dict[str, int] = {}
     subject_columns = [column for column in columns if normal_key(column).startswith("fag")]
-    for _, row in table.iterrows():
+    invalid_rows = []
+    for row_number, (_, row) in enumerate(table.iterrows(), 1):
         teacher_id = normal_key(row.get(id_col, ""))
         if not teacher_id:
+            if any(repair_text(value) for value in row.tolist()):
+                invalid_rows.append(f"række {row_number} mangler initialer")
             continue
         if capacity_col is not None:
-            found = re.search(r"\d+", value_at(row, capacity_col))
-            if found:
-                capacities[teacher_id] = int(found.group())
+            try:
+                parsed_capacity = parse_capacity(value_at(row, capacity_col))
+                capacities[teacher_id] = min(capacities.get(teacher_id, parsed_capacity), parsed_capacity)
+            except ValueError as error:
+                invalid_rows.append(f"{teacher_id}: {error}")
         subjects = []
         course_values = [row.get(course_col)] + [row.get(column) for column in subject_columns if column != course_col]
         for course in course_values:
@@ -387,8 +461,6 @@ def parse_teachers(table: pd.DataFrame, technical: dict[str, str] | None = None)
                     subject = detailed
             if subject and canonical_subject(subject) not in {canonical_subject(item) for item in subjects}:
                 subjects.append(subject)
-        if not subjects:
-            continue
         teachers_by_id.setdefault(teacher_id, {"id": teacher_id, "name": value_at(row, name_col) or teacher_id, "subjects": [], "holds": []})
         for subject in subjects:
             if canonical_subject(subject) not in {canonical_subject(item) for item in teachers_by_id[teacher_id]["subjects"]}:
@@ -397,6 +469,9 @@ def parse_teachers(table: pd.DataFrame, technical: dict[str, str] | None = None)
             hold = value_at(row, column)
             if hold and normal_key(hold) not in {normal_key(item) for item in teachers_by_id[teacher_id]["holds"]}:
                 teachers_by_id[teacher_id]["holds"].append(hold)
+    if invalid_rows:
+        suffix = " …" if len(invalid_rows) > 10 else ""
+        raise ValueError("Lærerarket indeholder ugyldige rækker: " + "; ".join(invalid_rows[:10]) + suffix + ".")
     teachers = sorted(teachers_by_id.values(), key=lambda item: item["id"])
     return teachers, capacities
 
@@ -416,9 +491,9 @@ def parse_teacher_upload(uploaded: Any, technical: dict[str, str] | None = None)
             if len(row) < 2:
                 continue
             teacher_id = normal_key(row.iloc[0])
-            found = re.search(r"\d+", repair_text(row.iloc[1]))
-            if teacher_id and found:
-                value = int(found.group())
+            raw_capacity = repair_text(row.iloc[1])
+            if teacher_id and raw_capacity:
+                value = parse_capacity(raw_capacity)
                 capacities[teacher_id] = min(capacities.get(teacher_id, value), value)
     return teachers, capacities
 
@@ -442,7 +517,8 @@ def build_candidates(teachers: list[dict[str, Any]]) -> dict[str, list[str]]:
 
 
 def wished_count(student: dict[str, Any], assigned: list[str | None]) -> int:
-    return sum(bool(teacher_id and teacher_id in student["wishes"]) for teacher_id in assigned)
+    """Antal forskellige lærerønsker, som er repræsenteret i tildelingen."""
+    return wish_status(student, assigned)[0]
 
 
 def optimize(
@@ -649,20 +725,26 @@ def score_solution(students: list[dict[str, Any]], teachers: list[dict[str, Any]
         value = capacities.get(teacher_id, 0)
         return min(K, value) if use_global_k else value
     unassigned = sum(len([item for item in assigned if item is None]) > 0 for assigned in assignments)
-    none = one = both = desired_total = capacity_blocked_slots = 0
+    none = one = both = desired_total = requested_total = no_wishes = all_wishes = capacity_blocked_slots = 0
     blocked_students = set()
     pair_counts = Counter()
     class_counts = Counter()
     for index, assigned in enumerate(assignments):
         student = students[index]
         count = wished_count(student, assigned)
+        _, requested = wish_status(student, assigned)
         desired_total += count
-        if count == 0:
+        requested_total += requested
+        if requested == 0:
+            no_wishes += 1
+        elif count == 0:
             none += 1
-        elif count == 1:
-            one += 1
-        else:
+        elif count >= 2:
             both += 1
+        else:
+            one += 1
+        if requested and count == requested:
+            all_wishes += 1
         for slot, teacher_id in enumerate(assigned):
             if not teacher_id:
                 possible = candidates.get(canonical_subject(student["subjects"][slot]), [])
@@ -681,11 +763,19 @@ def score_solution(students: list[dict[str, Any]], teachers: list[dict[str, Any]
     load_squares = sum(load * load for load in loads.values())
     pair_score = sum(value * (value - 1) // 2 for value in pair_counts.values())
     class_score = sum(value * (value - 1) // 2 for value in class_counts.values())
-    score = k_overload * 1e15 + unassigned * 1e12 + overload * 1e9 + none * 1e6 + (len(students) * 2 - desired_total) * 1e4 - (pair_score * .05 if prioritize_pairs else 0) - (class_score * .05 if prioritize_classes else 0) + max_load * 100 + load_squares
-    return {"score": score, "unassigned": int(unassigned), "none": none, "one": one, "both": both, "desired_total": desired_total, "overload": overload, "over_teachers": over_teachers, "k_overload": k_overload, "k_over_teachers": k_over_teachers, "max_load": max_load, "same_teacher_pair_score": pair_score, "same_class_teacher_score": class_score, "capacity_blocked_slots": capacity_blocked_slots, "capacity_blocked_students": len(blocked_students)}
+    score = k_overload * 1e15 + unassigned * 1e12 + overload * 1e9 + none * 1e6 + (requested_total - desired_total) * 1e4 - (pair_score * .05 if prioritize_pairs else 0) - (class_score * .05 if prioritize_classes else 0) + max_load * 100 + load_squares
+    return {"score": score, "unassigned": int(unassigned), "none": none, "one": one, "both": both, "no_wishes": no_wishes, "all_wishes": all_wishes, "wish_students": len(students) - no_wishes, "requested_total": requested_total, "desired_total": desired_total, "overload": overload, "over_teachers": over_teachers, "k_overload": k_overload, "k_over_teachers": k_over_teachers, "max_load": max_load, "same_teacher_pair_score": pair_score, "same_class_teacher_score": class_score, "capacity_blocked_slots": capacity_blocked_slots, "capacity_blocked_students": len(blocked_students)}
 
 
-def subject_stats(students: list[dict[str, Any]], teachers: list[dict[str, Any]], capacities: dict[str, int], K: int, use_global_k: bool) -> pd.DataFrame:
+def subject_stats(
+    students: list[dict[str, Any]],
+    teachers: list[dict[str, Any]],
+    capacities: dict[str, int],
+    K: int,
+    use_global_k: bool,
+    allow_over_capacity: bool = False,
+    lock_teacher_max: bool = False,
+) -> pd.DataFrame:
     candidates = build_candidates(teachers)
     grouped: dict[str, dict[str, Any]] = {}
     for student in students:
@@ -693,9 +783,10 @@ def subject_stats(students: list[dict[str, Any]], teachers: list[dict[str, Any]]
             key = canonical_subject(subject)
             grouped.setdefault(key, {"Fag": subject, "Elever": set()})["Elever"].add(student["id"])
     rows = []
+    permit_over = use_global_k and allow_over_capacity and not lock_teacher_max
     for key, item in grouped.items():
         ids = candidates.get(key, [])
-        capacity = sum(min(K, capacities.get(teacher_id, 0)) if use_global_k else capacities.get(teacher_id, 0) for teacher_id in ids)
+        capacity = sum(K if permit_over else min(K, capacities.get(teacher_id, 0)) if use_global_k else capacities.get(teacher_id, 0) for teacher_id in ids)
         rows.append({"Fag": item["Fag"], "Elever": len(item["Elever"]), "Lærere": len(ids), "Kapacitet": capacity, "Elever pr. lærer": round(len(item["Elever"]) / len(ids), 1) if ids else None, "Lærerinitialer": ", ".join(ids), "Mangler kapacitet": max(0, len(item["Elever"]) - capacity)})
     return pd.DataFrame(rows).sort_values(["Mangler kapacitet", "Elever pr. lærer", "Elever"], ascending=[False, False, False]) if rows else pd.DataFrame()
 
@@ -712,15 +803,19 @@ def make_export(
     rows = []
     for index, student in enumerate(students):
         assigned = solution["assignments"][index]
-        rows.append({"Elev-ID": student["id"], "Elev": student["name"], "Klasse": student.get("className", ""), "Fag 1": student["subjects"][0], "Vejleder fag 1": teacher_label(assigned[0], teacher_map), "Vejleder-ID 1": assigned[0] or "", "Fag 2": student["subjects"][1], "Vejleder fag 2": teacher_label(assigned[1], teacher_map), "Vejleder-ID 2": assigned[1] or "", "Ønsker opfyldt": wished_count(student, assigned), "Projekttitel": student.get("projectTitle", ""), "Projektbeskrivelse": student.get("projectDescription", "")})
+        fulfilled_wishes, requested_wishes = wish_status(student, assigned)
+        rows.append({"Elev-ID": student["id"], "Elev": student["name"], "Klasse": student.get("className", ""), "Fag 1": student["subjects"][0], "Vejleder fag 1": teacher_label(assigned[0], teacher_map), "Vejleder-ID 1": assigned[0] or "", "Fag 2": student["subjects"][1], "Vejleder fag 2": teacher_label(assigned[1], teacher_map), "Vejleder-ID 2": assigned[1] or "", "Ønsker angivet": requested_wishes, "Ønsker opfyldt": fulfilled_wishes, "Projekttitel": student.get("projectTitle", ""), "Projektbeskrivelse": student.get("projectDescription", "")})
     distribution = pd.DataFrame(rows)
     load_rows = []
     for teacher in sorted(teachers, key=lambda item: teacher_label(item["id"], teacher_map)):
         load = solution["loads"].get(teacher["id"], 0)
-        limit = min(solution["K"], capacities.get(teacher["id"], 0)) if use_global_k else capacities.get(teacher["id"], 0)
-        load_rows.append({"Lærer": teacher_label(teacher["id"], teacher_map), "Initialer": teacher["id"], "Fag": " · ".join(teacher["subjects"]), "Antal elever": load, "Max": limit, "Over max": max(0, load - limit), "Dobbeltvejledninger": solution["double_loads"].get(teacher["id"], 0)})
+        individual_limit = int(capacities.get(teacher["id"], 0))
+        normal_limit = min(solution["K"], individual_limit) if use_global_k else individual_limit
+        permit_over = use_global_k and solution.get("allow_over_capacity", False) and not solution.get("lock_teacher_max", False)
+        hard_limit = solution["K"] if permit_over else normal_limit
+        load_rows.append({"Lærer": teacher_label(teacher["id"], teacher_map), "Initialer": teacher["id"], "Fag": " · ".join(teacher["subjects"]), "Antal elever": load, "Individuelt max": individual_limit, "Hård grænse": hard_limit, "Over individuelt max": max(0, load - normal_limit), "Over hård grænse": max(0, load - hard_limit), "Dobbeltvejledninger": solution["double_loads"].get(teacher["id"], 0)})
     loads = pd.DataFrame(load_rows)
-    stats = subject_stats(students, teachers, capacities, solution["K"], use_global_k)
+    stats = subject_stats(students, teachers, capacities, solution["K"], use_global_k, solution.get("allow_over_capacity", False), solution.get("lock_teacher_max", False))
     unassigned = distribution[distribution[["Vejleder-ID 1", "Vejleder-ID 2"]].eq("").any(axis=1)]
     if selected_sheets is not None:
         sheet_frames = {
@@ -738,7 +833,7 @@ def make_export(
         selected_output = io.BytesIO()
         with pd.ExcelWriter(selected_output, engine="openpyxl") as writer:
             for sheet_name in selected:
-                sheet_frames[sheet_name].to_excel(writer, index=False, sheet_name=sheet_name)
+                safe_excel_frame(sheet_frames[sheet_name]).to_excel(writer, index=False, sheet_name=sheet_name)
             for sheet in writer.book.worksheets:
                 sheet.freeze_panes = "A2"
                 sheet.auto_filter.ref = sheet.dimensions
@@ -748,10 +843,10 @@ def make_export(
         return selected_output.getvalue()
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        distribution.to_excel(writer, index=False, sheet_name="Fordeling")
-        loads.to_excel(writer, index=False, sheet_name="Lærerbelastning")
-        stats.to_excel(writer, index=False, sheet_name="Fagstatistik")
-        unassigned.to_excel(writer, index=False, sheet_name="Ikke tildelte")
+        safe_excel_frame(distribution).to_excel(writer, index=False, sheet_name="Fordeling")
+        safe_excel_frame(loads).to_excel(writer, index=False, sheet_name="Lærerbelastning")
+        safe_excel_frame(stats).to_excel(writer, index=False, sheet_name="Fagstatistik")
+        safe_excel_frame(unassigned).to_excel(writer, index=False, sheet_name="Ikke tildelte")
         for sheet in writer.book.worksheets:
             sheet.freeze_panes = "A2"
             sheet.auto_filter.ref = sheet.dimensions
@@ -980,14 +1075,20 @@ def make_schedule(
             cursor = next_start
         else:
             cursor = round_end
-    if not lunch_added and lunch_mode == "Fast tidspunkt for alle lærere":
-        lunch_interval = (lunch_start_dt, lunch_end_dt)
+    if not lunch_added:
+        if lunch_mode == "Fast tidspunkt for alle lærere":
+            final_lunch_start = lunch_start_dt
+            final_lunch_end = lunch_end_dt
+        else:
+            final_lunch_start = cursor
+            final_lunch_end = cursor + timedelta(minutes=lunch_minutes)
+        lunch_interval = (final_lunch_start, final_lunch_end)
         timeline_rows.append({
-            "_sort": (last_round + 1, -1), "Type": "Frokostpause", "Start": _clock_label(lunch_start_dt),
-            "Slut": _clock_label(lunch_end_dt), "Varighed (min.)": lunch_minutes, "Elev": "", "Klasse": "",
+            "_sort": (last_round + 1, -1), "Type": "Frokostpause", "Start": _clock_label(final_lunch_start),
+            "Slut": _clock_label(final_lunch_end), "Varighed (min.)": lunch_minutes, "Elev": "", "Klasse": "",
             "Lærer(e)": "Alle lærere", "Information": "Frokostpause", "Bemærkning": "",
         })
-        cursor = max(cursor, lunch_end_dt)
+        cursor = max(cursor, final_lunch_end)
     if cursor > day_end:
         required = int((cursor - plan_start).total_seconds() // 60)
         available = int((day_end - plan_start).total_seconds() // 60)
@@ -1152,6 +1253,7 @@ def make_teacher_gantt_html(schedule: dict[str, Any], selected_teacher: str | No
     rows = []
     for name in names:
         teacher_rows = frame[frame["Lærer"] == name].sort_values(["Start", "Slut"])
+        guidance_count = int((teacher_rows["Type"] == "Vejledning").sum()) if "Type" in teacher_rows else len(teacher_rows)
         blocks = []
         for _, row in teacher_rows.iterrows():
             start = clock_minutes(row["Start"])
@@ -1167,7 +1269,7 @@ def make_teacher_gantt_html(schedule: dict[str, Any], selected_teacher: str | No
                 f'<strong>{html.escape(student)}</strong><small>{html.escape(subject)}</small></div>'
             )
         rows.append(
-            f'<div class="gantt-row"><div class="gantt-name">{html.escape(name)}<small>{len(teacher_rows)} elev(er)</small></div>'
+            f'<div class="gantt-row"><div class="gantt-name">{html.escape(name)}<small>{guidance_count} elev(er)</small></div>'
             f'<div class="gantt-track">{"".join(blocks)}</div></div>'
         )
 
@@ -1199,11 +1301,11 @@ def make_teacher_gantt_html(schedule: dict[str, Any], selected_teacher: str | No
 def make_schedule_excel(schedule: dict[str, Any]) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        schedule["students"].to_excel(writer, index=False, sheet_name="Elevplan")
-        schedule["teachers"].to_excel(writer, index=False, sheet_name="Lærerplan")
-        schedule["timeline"].to_excel(writer, index=False, sheet_name="Tidslinje")
-        schedule["pairs"].to_excel(writer, index=False, sheet_name="Lærerpar")
-        pd.DataFrame([schedule["settings"]]).to_excel(writer, index=False, sheet_name="Indstillinger")
+        safe_excel_frame(schedule["students"]).to_excel(writer, index=False, sheet_name="Elevplan")
+        safe_excel_frame(schedule["teachers"]).to_excel(writer, index=False, sheet_name="Lærerplan")
+        safe_excel_frame(schedule["timeline"]).to_excel(writer, index=False, sheet_name="Tidslinje")
+        safe_excel_frame(schedule["pairs"]).to_excel(writer, index=False, sheet_name="Lærerpar")
+        safe_excel_frame(pd.DataFrame([schedule["settings"]])).to_excel(writer, index=False, sheet_name="Indstillinger")
         for sheet in writer.book.worksheets:
             sheet.freeze_panes = "A2"
             sheet.auto_filter.ref = sheet.dimensions
@@ -1281,7 +1383,11 @@ def make_docx_zip(students: list[dict[str, Any]], teachers: list[dict[str, Any]]
                 document.add_paragraph(f"{student['subjects'][0]}: {teacher_label(assigned[0], teacher_map)}")
                 document.add_paragraph(f"{student['subjects'][1]}: {teacher_label(assigned[1], teacher_map)}")
                 output = io.BytesIO(); document.save(output); content = output.getvalue()
-            filename = re.sub(r"[<>:\"/\\|?*]", "-", f"SOP - {student['name']}.docx")
+            identity = repair_text(student.get("id")) or f"elev-{index + 1}"
+            filename = re.sub(r"[<>:\"/\\|?*]", "-", f"SOP - {student['name']} - {identity}.docx")
+            filename = re.sub(r"\s+", " ", filename).strip(" .")
+            if filename in archive.namelist():
+                filename = re.sub(r"\.docx$", f" - {index + 1}.docx", filename, flags=re.I)
             archive.writestr(filename, content)
     return files.getvalue()
 
@@ -1404,20 +1510,24 @@ def frame_to_teachers(frame: pd.DataFrame, technical: dict[str, str] | None = No
             if hold and normal_key(hold) not in {normal_key(item) for item in teacher["holds"]}:
                 teacher["holds"].append(hold)
         raw_max = value_at(row, "Max")
-        found = re.search(r"\d+", raw_max)
-        capacities[teacher_id] = int(found.group()) if found else 0
+        capacities[teacher_id] = parse_capacity(raw_max)
     return sorted(teachers_by_id.values(), key=lambda item: item["id"]), capacities
 
 
 def resolve_wishes(students: list[dict[str, Any]], teachers: list[dict[str, Any]]) -> None:
     """Tillad både initialer og lærernavne i ønskekolonnerne."""
     lookup = {}
+    name_ids: dict[str, set[str]] = defaultdict(set)
     teacher_map = {teacher["id"]: teacher for teacher in teachers}
     for teacher in teachers:
         lookup[normal_key(teacher["id"])] = teacher["id"]
-        lookup[normal_key(teacher.get("name", ""))] = teacher["id"]
+        if normal_key(teacher.get("name", "")):
+            name_ids[normal_key(teacher.get("name", ""))].add(teacher["id"])
         # Elevarket viser etiketten "Navn (initialer)"; den skal også kunne læses tilbage.
         lookup[normal_key(teacher_label(teacher["id"], teacher_map))] = teacher["id"]
+    for name, ids in name_ids.items():
+        if len(ids) == 1:
+            lookup[name] = next(iter(ids))
     no_wishes_key = normal_key(NO_WISHES_LABEL)
     for student in students:
         resolved = []
@@ -1434,13 +1544,27 @@ def input_validation(students: list[dict[str, Any]], teachers: list[dict[str, An
     candidates = build_candidates(teachers)
     teacher_map = {teacher["id"]: teacher for teacher in teachers}
     unknown_wishes = []
+    ambiguous_wishes = []
     missing_subjects = []
     incompatible_wishes = []
     partial_wishes = []
+    teacher_names: dict[str, list[str]] = defaultdict(list)
+    for teacher in teachers:
+        name_key = normal_key(teacher.get("name", ""))
+        if name_key and teacher["id"] not in teacher_names[name_key]:
+            teacher_names[name_key].append(teacher["id"])
+    ambiguous_names = {name: ids for name, ids in teacher_names.items() if len(ids) > 1}
     for student in students:
         for wish in student.get("wishes", []):
             if wish not in teacher_ids:
-                unknown_wishes.append({"Elev": student["name"], "Ønskevejleder": wish})
+                if normal_key(wish) in ambiguous_names:
+                    ambiguous_wishes.append({
+                        "Elev": student["name"],
+                        "Ønskevejleder": wish,
+                        "Mulige initialer": " · ".join(ambiguous_names[normal_key(wish)]),
+                    })
+                else:
+                    unknown_wishes.append({"Elev": student["name"], "Ønskevejleder": wish})
         for subject in student.get("subjects", []):
             if subject and not candidates.get(canonical_subject(subject), []):
                 missing_subjects.append({"Elev": student["name"], "Fag": subject})
@@ -1475,6 +1599,7 @@ def input_validation(students: list[dict[str, Any]], teachers: list[dict[str, An
 
     return {
         "unknown_wishes": unknown_wishes,
+        "ambiguous_wishes": unique_rows(ambiguous_wishes),
         "missing_subjects": unique_rows(missing_subjects),
         "incompatible_wishes": unique_rows(incompatible_wishes),
         "partial_wishes": unique_rows(partial_wishes),
@@ -1545,6 +1670,10 @@ def data_readiness(students: list[dict[str, Any]], teachers: list[dict[str, Any]
         subjects = list(student.get("subjects", []))
         if len(subjects) < 2 or any(not repair_text(subject) for subject in subjects[:2]):
             errors.append(f"Elev {student.get('name') or index} skal have både Fag 1 og Fag 2.")
+    student_ids = [normal_key(student.get("id", "")) for student in students if normal_key(student.get("id", ""))]
+    duplicate_student_ids = sorted(item for item, count in Counter(student_ids).items() if count > 1)
+    if duplicate_student_ids:
+        errors.append("Elev-ID skal være entydige. Dubletter: " + ", ".join(duplicate_student_ids[:8]) + ".")
     for index, teacher in enumerate(teachers, 1):
         if not normal_key(teacher.get("id")):
             errors.append(f"Lærer række {index} mangler initialer.")
@@ -1554,6 +1683,8 @@ def data_readiness(students: list[dict[str, Any]], teachers: list[dict[str, Any]
     validation = input_validation(students, teachers)
     if validation["unknown_wishes"]:
         errors.append(f"{len(validation['unknown_wishes'])} ønskevejleder(e) findes ikke i lærerlisten.")
+    if validation["ambiguous_wishes"]:
+        errors.append(f"{len(validation['ambiguous_wishes'])} ønskevejleder(e) er tvetydige og skal vælges med initialer.")
     if validation["missing_subjects"]:
         errors.append(f"{len(validation['missing_subjects'])} elevfag har ingen lærer.")
     if validation["incompatible_wishes"]:
@@ -1561,11 +1692,143 @@ def data_readiness(students: list[dict[str, Any]], teachers: list[dict[str, Any]
     return errors
 
 
+def assignment_assessment(
+    students: list[dict[str, Any]],
+    teachers: list[dict[str, Any]],
+    capacities: dict[str, int],
+    assignments: list[list[str | None]],
+    K: int,
+    double_limit: int,
+    use_global_k: bool,
+    allow_over_capacity: bool,
+    lock_teacher_max: bool,
+) -> dict[str, Any]:
+    """Kontrollér en automatisk eller manuel fordeling mod alle hårde regler."""
+    teacher_ids = {teacher["id"] for teacher in teachers}
+    candidates = build_candidates(teachers)
+    loads = {teacher_id: 0 for teacher_id in teacher_ids}
+    double_loads = {teacher_id: 0 for teacher_id in teacher_ids}
+    errors: list[str] = []
+    warnings: list[str] = []
+    incomplete = 0
+
+    if len(assignments) != len(students):
+        errors.append("Antallet af tildelinger svarer ikke til antallet af elever.")
+    for index, student in enumerate(students):
+        assigned = list(assignments[index]) if index < len(assignments) else [None, None]
+        assigned = (assigned + [None, None])[:2]
+        if any(not teacher_id for teacher_id in assigned):
+            incomplete += 1
+        for slot, teacher_id in enumerate(assigned):
+            if not teacher_id:
+                continue
+            teacher_id = normal_key(teacher_id)
+            subject = student.get("subjects", ["", ""])[slot]
+            if teacher_id not in teacher_ids:
+                errors.append(f"{student['name']}: læreren {teacher_id} findes ikke i lærerlisten.")
+            elif teacher_id not in candidates.get(canonical_subject(subject), []):
+                errors.append(f"{student['name']}: {teacher_id} underviser ikke i {subject}.")
+        for teacher_id in set(normal_key(item) for item in assigned if item and normal_key(item) in loads):
+            loads[teacher_id] += 1
+        if assigned[0] and normal_key(assigned[0]) == normal_key(assigned[1]):
+            teacher_id = normal_key(assigned[0])
+            if teacher_id in double_loads:
+                double_loads[teacher_id] += 1
+
+    permit_over = use_global_k and allow_over_capacity and not lock_teacher_max
+    for teacher_id, load in sorted(loads.items()):
+        individual = int(capacities.get(teacher_id, 0))
+        normal_limit = min(K, individual) if use_global_k else individual
+        hard_limit = K if permit_over else normal_limit
+        if load > hard_limit:
+            errors.append(f"{teacher_id} har {load} elever, men den hårde grænse er {hard_limit}.")
+        elif load > normal_limit:
+            warnings.append(f"{teacher_id} har {load} elever og ligger {load - normal_limit} over sit individuelle max.")
+        if double_loads[teacher_id] > double_limit:
+            errors.append(
+                f"{teacher_id} har {double_loads[teacher_id]} dobbeltvejledninger, men I-grænsen er {double_limit}."
+            )
+    if incomplete:
+        warnings.append(f"{incomplete} elev(er) mangler mindst én vejleder.")
+    return {
+        "errors": errors,
+        "warnings": warnings,
+        "loads": loads,
+        "double_loads": double_loads,
+        "incomplete": incomplete,
+    }
+
+
+def stable_signature(payload: Any) -> str:
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def distribution_signature(
+    students: list[dict[str, Any]],
+    teachers: list[dict[str, Any]],
+    capacities: dict[str, int],
+    K: int,
+    double_limit: int,
+    use_global_k: bool,
+    allow_over_capacity: bool,
+    lock_teacher_max: bool,
+    prioritize_pairs: bool,
+    prioritize_classes: bool,
+    attempts: int,
+) -> str:
+    return stable_signature({
+        "students": students,
+        "teachers": teachers,
+        "capacities": {key: int(value) for key, value in capacities.items()},
+        "rules": [K, double_limit, use_global_k, allow_over_capacity, lock_teacher_max, prioritize_pairs, prioritize_classes, attempts],
+    })
+
+
+def schedule_signature(
+    students: list[dict[str, Any]],
+    teachers: list[dict[str, Any]],
+    solution: dict[str, Any],
+    settings: list[Any],
+) -> str:
+    return stable_signature({
+        "students": students,
+        "teachers": teachers,
+        "assignments": solution.get("assignments", []),
+        "settings": settings,
+    })
+
+
+def invalidate_derived_state(reason: str = "", *, require_approval: bool = False) -> None:
+    """Fjern resultater, der ikke længere svarer til de aktuelle data eller regler."""
+    had_result = st.session_state.get("solution") is not None or st.session_state.get("v2_schedule") is not None
+    st.session_state["solution"] = None
+    st.session_state["v2_schedule"] = None
+    st.session_state["v2_schedule_signature"] = None
+    st.session_state["v2_docx_zip"] = None
+    if require_approval:
+        st.session_state["input_loaded"] = False
+    if reason and had_result:
+        st.session_state["v2_stale_notice"] = reason
+
+
+def approve_data_and_navigate(next_step: str | None = None) -> None:
+    st.session_state["input_loaded"] = True
+    invalidate_derived_state()
+    st.session_state["v2_stale_notice"] = ""
+    if next_step:
+        st.session_state["v2_active_step"] = next_step
+
+
+def navigate_to_step(step: str) -> None:
+    st.session_state["v2_active_step"] = step
+
+
 def make_input_export(students: list[dict[str, Any]], teachers: list[dict[str, Any]], capacities: dict[str, int]) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        students_to_frame(students, teachers).to_excel(writer, index=False, sheet_name="Elevdata")
-        teachers_to_frame(teachers, capacities).to_excel(writer, index=False, sheet_name="Lærerdata")
+        safe_excel_frame(students_to_frame(students, teachers)).to_excel(writer, index=False, sheet_name="Elevdata")
+        safe_excel_frame(teachers_to_frame(teachers, capacities)).to_excel(writer, index=False, sheet_name="Lærerdata")
         for sheet in writer.book.worksheets:
             sheet.freeze_panes = "A2"
             sheet.auto_filter.ref = sheet.dimensions
@@ -1583,7 +1846,7 @@ def make_teacher_export(
 ) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        teachers_to_frame(teachers, capacities, subject_count, hold_count).to_excel(writer, index=False, sheet_name="Lærerdata")
+        safe_excel_frame(teachers_to_frame(teachers, capacities, subject_count, hold_count)).to_excel(writer, index=False, sheet_name="Lærerdata")
         sheet = writer.book["Lærerdata"]
         sheet.freeze_panes = "A2"
         sheet.auto_filter.ref = sheet.dimensions
@@ -1606,6 +1869,30 @@ def load_default_state(load_students: bool = True, load_teachers: bool = True) -
     st.session_state.setdefault("teachers", teachers if load_teachers else [])
     st.session_state.setdefault("capacities", capacities if load_teachers else {})
     st.session_state.setdefault("solution", None)
+
+
+def activate_demo_data() -> None:
+    """Indlæs et komplet, valideret demosæt i den aktuelle app-session."""
+    demo_students = parse_students(read_path_table(TEST_STUDENTS_FILE))
+    demo_teachers, demo_capacities = parse_teachers(read_path_table(TEST_TEACHERS_FILE))
+    resolve_wishes(demo_students, demo_teachers)
+    readiness_errors = data_readiness(demo_students, demo_teachers)
+    st.session_state["students"] = demo_students
+    st.session_state["teachers"] = demo_teachers
+    st.session_state["capacities"] = {
+        teacher["id"]: int(demo_capacities.get(teacher["id"], 0))
+        for teacher in demo_teachers
+    }
+    st.session_state["student_revision"] = st.session_state.get("student_revision", 0) + 1
+    st.session_state["teacher_revision"] = st.session_state.get("teacher_revision", 0) + 1
+    st.session_state["capacity_revision"] = st.session_state.get("capacity_revision", 0) + 1
+    st.session_state["input_loaded"] = not readiness_errors
+    st.session_state["solution"] = None
+    st.session_state["v2_schedule"] = None
+    st.session_state["v2_schedule_signature"] = None
+    st.session_state["v2_docx_zip"] = None
+    st.session_state["v2_stale_notice"] = ""
+    st.session_state["v2_demo_mode"] = True
 
 
 def legacy_main() -> None:
@@ -1849,18 +2136,61 @@ if False and __name__ == "__main__":
 
 
 def main() -> None:
-    st.set_page_config(page_title="SOPtima · demo med fiktive data", page_icon="🎓", layout="wide", initial_sidebar_state="expanded")
+    st.set_page_config(
+        page_title="SOPtima · intelligent vejlederfordeling",
+        page_icon="🎓",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
     st.markdown("""
     <style>
-      :root { --ink:#172126; --muted:#66777f; --brand:#075f5b; }
-      .stApp { background: radial-gradient(circle at 8% 0%, rgba(15,129,122,.12), transparent 31rem), linear-gradient(180deg,#f7fbf9 0,#fffdf8 24rem); }
-      h1,h2,h3 { font-family: Georgia, 'Times New Roman', serif; letter-spacing:-.025em; }
-      .hero-kicker { color:var(--brand); font-size:.76rem; font-weight:800; letter-spacing:.14em; text-transform:uppercase; margin-bottom:.35rem; }
-      .info-card, .metric-card { border:1px solid #dce4e2; border-radius:14px; padding:1rem 1.15rem; background:rgba(255,255,255,.78); }
-      .metric-card { min-height:92px; }
-      .metric-value { display:block; font:700 2rem/1 Georgia,serif; color:#172126; }
-      .metric-label { color:#66777f; font-size:.72rem; font-weight:800; letter-spacing:.07em; text-transform:uppercase; }
-      div[data-testid='stDataFrame'], div[data-testid='stDataEditor'] { border:1px solid #dce4e2; border-radius:12px; overflow:hidden; }
+      :root {
+        --ink:#152326; --muted:#637477; --brand:#08756f; --brand-dark:#055852;
+        --brand-soft:#e8f5f2; --line:#dbe6e3; --paper:#ffffff; --warm:#fffaf1;
+      }
+      .stApp {
+        background:
+          radial-gradient(circle at 8% -4%, rgba(17,145,134,.14), transparent 28rem),
+          radial-gradient(circle at 94% 8%, rgba(233,174,73,.10), transparent 24rem),
+          linear-gradient(180deg,#f7fbfa 0,#fffdf8 30rem,#f9fbfa 100%);
+        color:var(--ink);
+      }
+      [data-testid='stHeader'] { background:rgba(247,251,250,.72); backdrop-filter:blur(12px); }
+      [data-testid='stAppViewBlockContainer'] { max-width:1480px; padding-top:1.5rem; padding-bottom:4rem; }
+      section[data-testid='stSidebar'] { background:linear-gradient(180deg,#f0f8f6 0,#fbfcfa 58%,#fffaf1 100%); border-right:1px solid var(--line); }
+      section[data-testid='stSidebar'] [data-testid='stSidebarContent'] { padding-top:1.1rem; }
+      h1,h2,h3 { font-family:Georgia,'Times New Roman',serif; letter-spacing:-.025em; color:var(--ink); }
+      h2 { margin-top:1.35rem; }
+      .soptima-brand { display:flex; align-items:center; gap:.7rem; margin:.2rem 0 1rem; }
+      .soptima-brand-icon { display:grid; place-items:center; width:2.25rem; height:2.25rem; border-radius:.75rem; background:linear-gradient(135deg,var(--brand),#12a195); color:white; box-shadow:0 8px 20px rgba(8,117,111,.22); font-size:1.05rem; }
+      .soptima-brand-name { font:700 1.34rem/1 Georgia,serif; color:var(--ink); }
+      .soptima-brand-sub { color:var(--muted); font-size:.72rem; margin-top:.12rem; }
+      .soptima-hero { position:relative; overflow:hidden; display:flex; gap:1rem; align-items:flex-start; padding:1.35rem 1.45rem; margin:0 0 1.35rem; border:1px solid rgba(8,117,111,.16); border-radius:20px; background:linear-gradient(120deg,rgba(255,255,255,.96),rgba(232,245,242,.86)); box-shadow:0 16px 38px rgba(22,54,51,.07); }
+      .soptima-hero::after { content:''; position:absolute; width:11rem; height:11rem; right:-4.5rem; top:-5.5rem; border-radius:50%; background:rgba(18,161,149,.08); }
+      .soptima-hero-icon { flex:0 0 auto; display:grid; place-items:center; width:2.8rem; height:2.8rem; border-radius:.9rem; background:var(--brand); color:white; font-size:1.25rem; box-shadow:0 8px 22px rgba(8,117,111,.22); }
+      .soptima-kicker { color:var(--brand-dark); font-size:.7rem; font-weight:800; letter-spacing:.14em; text-transform:uppercase; margin:.05rem 0 .3rem; }
+      .soptima-hero h1 { font-size:clamp(1.65rem,3vw,2.45rem); line-height:1.06; margin:0 0 .45rem; padding:0; }
+      .soptima-hero p { max-width:52rem; color:var(--muted); font-size:.98rem; line-height:1.55; margin:0; }
+      .source-pill { display:inline-flex; align-items:center; gap:.35rem; margin-top:.65rem; padding:.28rem .58rem; border-radius:999px; background:rgba(8,117,111,.09); color:var(--brand-dark); font-size:.72rem; font-weight:700; }
+      .sidebar-card { margin:.55rem 0 .8rem; padding:.78rem .85rem; border:1px solid var(--line); border-radius:13px; background:rgba(255,255,255,.72); }
+      .sidebar-card-title { color:var(--ink); font-weight:750; font-size:.82rem; margin-bottom:.45rem; }
+      .sidebar-row { display:flex; justify-content:space-between; gap:.7rem; color:var(--muted); font-size:.76rem; padding:.18rem 0; }
+      .sidebar-row strong { color:var(--ink); font-weight:700; text-align:right; }
+      .info-card,.metric-card { border:1px solid var(--line); border-radius:15px; padding:1rem 1.15rem; background:rgba(255,255,255,.86); box-shadow:0 8px 24px rgba(22,54,51,.04); }
+      .metric-card { min-height:96px; transition:transform .16s ease,box-shadow .16s ease; }
+      .metric-card:hover { transform:translateY(-2px); box-shadow:0 12px 28px rgba(22,54,51,.08); }
+      .metric-value { display:block; font:700 2rem/1 Georgia,serif; color:var(--ink); }
+      .metric-label { display:block; margin-top:.45rem; color:var(--muted); font-size:.68rem; font-weight:800; letter-spacing:.075em; text-transform:uppercase; }
+      div[data-testid='stDataFrame'],div[data-testid='stDataEditor'] { border:1px solid var(--line); border-radius:14px; overflow:hidden; box-shadow:0 7px 22px rgba(22,54,51,.035); }
+      [data-testid='stFileUploaderDropzone'] { border:1px dashed #9bbdb8; border-radius:14px; background:rgba(232,245,242,.48); }
+      div.stButton > button,div.stDownloadButton > button { border-radius:11px; min-height:2.55rem; font-weight:700; transition:transform .15s ease,box-shadow .15s ease,border-color .15s ease; }
+      div.stButton > button:hover,div.stDownloadButton > button:hover { transform:translateY(-1px); border-color:var(--brand); box-shadow:0 7px 18px rgba(8,117,111,.12); }
+      div.stButton > button[kind='primary'] { border:0; background:linear-gradient(135deg,var(--brand-dark),#0a8d84); box-shadow:0 8px 20px rgba(8,117,111,.19); }
+      .stTabs [data-baseweb='tab-list'] { gap:.35rem; border-bottom:1px solid var(--line); }
+      .stTabs [data-baseweb='tab'] { border-radius:9px 9px 0 0; padding:.45rem .78rem; }
+      [data-testid='stAlert'] { border-radius:13px; }
+      #MainMenu,footer { visibility:hidden; }
+      @media (max-width:700px) { .soptima-hero { padding:1rem; border-radius:16px; } .soptima-hero-icon { width:2.4rem; height:2.4rem; } }
     </style>
     """, unsafe_allow_html=True)
     load_default_state()
@@ -2255,47 +2585,122 @@ def main() -> None:
 
 def main_v2() -> None:
     """Trinopdelt arbejdsgang med navigation i venstremenuen."""
-    st.set_page_config(page_title="SOPtima · demo med fiktive data", page_icon="🎓", layout="wide", initial_sidebar_state="expanded")
+    st.set_page_config(page_title="SOPtima · vejlederfordeling og tidsplan", page_icon="🎓", layout="wide", initial_sidebar_state="expanded")
     st.markdown("""
     <style>
-      :root { --ink:#172126; --muted:#66777f; --brand:#075f5b; }
-      .stApp { background: radial-gradient(circle at 8% 0%, rgba(15,129,122,.12), transparent 31rem), linear-gradient(180deg,#f7fbf9 0,#fffdf8 24rem); }
-      h1,h2,h3 { font-family: Georgia, 'Times New Roman', serif; letter-spacing:-.025em; }
-      .hero-kicker { color:var(--brand); font-size:.76rem; font-weight:800; letter-spacing:.14em; text-transform:uppercase; margin-bottom:.35rem; }
-      .info-card, .metric-card { border:1px solid #dce4e2; border-radius:14px; padding:1rem 1.15rem; background:rgba(255,255,255,.78); }
-      .metric-card { min-height:92px; }
-      .metric-value { display:block; font:700 2rem/1 Georgia,serif; color:#172126; }
-      .metric-label { color:#66777f; font-size:.72rem; font-weight:800; letter-spacing:.07em; text-transform:uppercase; }
-      div[data-testid='stDataFrame'], div[data-testid='stDataEditor'] { border:1px solid #dce4e2; border-radius:12px; overflow:hidden; }
+      :root {
+        --ink:#152326; --muted:#5c6f72; --brand:#08756f; --brand-dark:#055852;
+        --brand-soft:#e8f5f2; --line:#d8e5e2; --paper:#ffffff; --warm:#fffaf1;
+      }
+      .stApp {
+        background:
+          radial-gradient(circle at 8% -4%,rgba(17,145,134,.14),transparent 28rem),
+          radial-gradient(circle at 94% 8%,rgba(233,174,73,.10),transparent 24rem),
+          linear-gradient(180deg,#f7fbfa 0,#fffdf8 30rem,#f9fbfa 100%);
+        color:var(--ink);
+      }
+      [data-testid='stHeader'] { background:rgba(247,251,250,.82); backdrop-filter:blur(12px); }
+      [data-testid='stAppViewBlockContainer'] { max-width:1480px; padding-top:1.25rem; padding-bottom:4rem; }
+      section[data-testid='stSidebar'] { background:linear-gradient(180deg,#eff8f6 0,#fbfcfa 58%,#fffaf1 100%); border-right:1px solid var(--line); }
+      section[data-testid='stSidebar'] [data-testid='stSidebarContent'] { padding-top:1rem; }
+      h1,h2,h3 { font-family:Georgia,'Times New Roman',serif; letter-spacing:-.025em; color:var(--ink); }
+      h2 { margin-top:1.35rem; }
+      p,li,label { line-height:1.52; }
+      .soptima-brand { display:flex; align-items:center; gap:.7rem; margin:.2rem 0 1rem; }
+      .soptima-brand-icon { display:grid; place-items:center; width:2.35rem; height:2.35rem; border-radius:.78rem; background:linear-gradient(135deg,var(--brand-dark),#12a195); color:white; box-shadow:0 8px 20px rgba(8,117,111,.22); font:bold 1.08rem Georgia,serif; }
+      .soptima-brand-name { font:700 1.34rem/1 Georgia,serif; color:var(--ink); }
+      .soptima-brand-sub { color:var(--muted); font-size:.72rem; margin-top:.12rem; }
+      .soptima-hero { position:relative; overflow:hidden; display:flex; gap:1rem; align-items:flex-start; padding:1.35rem 1.45rem; margin:0 0 1.35rem; border:1px solid rgba(8,117,111,.16); border-radius:20px; background:linear-gradient(120deg,rgba(255,255,255,.97),rgba(232,245,242,.9)); box-shadow:0 16px 38px rgba(22,54,51,.07); }
+      .soptima-hero::after { content:''; position:absolute; width:11rem; height:11rem; right:-4.5rem; top:-5.5rem; border-radius:50%; background:rgba(18,161,149,.08); pointer-events:none; }
+      .soptima-hero-icon { flex:0 0 auto; display:grid; place-items:center; width:2.8rem; height:2.8rem; border-radius:.9rem; background:var(--brand); color:white; font-size:1.25rem; box-shadow:0 8px 22px rgba(8,117,111,.22); }
+      .soptima-kicker { color:var(--brand-dark); font-size:.7rem; font-weight:800; letter-spacing:.14em; text-transform:uppercase; margin:.05rem 0 .3rem; }
+      .soptima-hero h1 { font-size:clamp(1.65rem,3vw,2.45rem); line-height:1.06; margin:0 0 .45rem; padding:0; }
+      .soptima-hero p { max-width:54rem; color:var(--muted); font-size:.98rem; line-height:1.55; margin:0; }
+      .source-pill { display:inline-flex; align-items:center; gap:.35rem; margin-top:.65rem; padding:.3rem .62rem; border-radius:999px; background:rgba(8,117,111,.09); color:var(--brand-dark); font-size:.72rem; font-weight:750; }
+      .sidebar-card { margin:.6rem 0 .8rem; padding:.8rem .86rem; border:1px solid var(--line); border-radius:13px; background:rgba(255,255,255,.76); box-shadow:0 7px 20px rgba(22,54,51,.035); }
+      .sidebar-card-title { color:var(--ink); font-weight:750; font-size:.82rem; margin-bottom:.45rem; }
+      .sidebar-row { display:flex; justify-content:space-between; gap:.7rem; color:var(--muted); font-size:.76rem; padding:.2rem 0; }
+      .sidebar-row strong { color:var(--ink); font-weight:700; text-align:right; }
+      .metric-card { border:1px solid var(--line); border-radius:15px; padding:1rem 1.12rem; background:rgba(255,255,255,.9); box-shadow:0 8px 24px rgba(22,54,51,.04); min-height:96px; transition:transform .16s ease,box-shadow .16s ease; }
+      .metric-card:hover { transform:translateY(-2px); box-shadow:0 12px 28px rgba(22,54,51,.08); }
+      .metric-value { display:block; font:700 2rem/1 Georgia,serif; color:var(--ink); }
+      .metric-label { display:block; margin-top:.45rem; color:var(--muted); font-size:.68rem; font-weight:800; letter-spacing:.07em; text-transform:uppercase; }
+      .section-note { padding:.82rem 1rem; margin:.4rem 0 1rem; border-left:4px solid var(--brand); border-radius:0 10px 10px 0; background:rgba(232,245,242,.72); color:#344f51; }
+      div[data-testid='stDataFrame'],div[data-testid='stDataEditor'] { border:1px solid var(--line); border-radius:14px; overflow:hidden; box-shadow:0 7px 22px rgba(22,54,51,.035); }
+      [data-testid='stFileUploaderDropzone'] { border:1px dashed #8db6b0; border-radius:14px; background:rgba(232,245,242,.52); }
+      div.stButton > button,div.stDownloadButton > button { border-radius:11px; min-height:2.55rem; font-weight:700; transition:transform .15s ease,box-shadow .15s ease,border-color .15s ease; }
+      div.stButton > button:hover,div.stDownloadButton > button:hover { transform:translateY(-1px); border-color:var(--brand); box-shadow:0 7px 18px rgba(8,117,111,.12); }
+      div.stButton > button[kind='primary'] { border:0; background:linear-gradient(135deg,var(--brand-dark),#0a8d84); box-shadow:0 8px 20px rgba(8,117,111,.19); }
+      div.stButton > button:focus-visible,div.stDownloadButton > button:focus-visible,[role='radio']:focus-visible { outline:3px solid #e09a2f!important; outline-offset:3px; }
+      .stTabs [data-baseweb='tab-list'] { gap:.35rem; border-bottom:1px solid var(--line); }
+      .stTabs [data-baseweb='tab'] { border-radius:9px 9px 0 0; padding:.48rem .8rem; }
+      [data-testid='stAlert'] { border-radius:13px; }
+      [data-testid='stSidebar'] [role='radiogroup'] label { border-radius:10px; padding:.3rem .45rem; margin:.08rem 0; }
+      [data-testid='stSidebar'] [role='radiogroup'] label:hover { background:rgba(8,117,111,.07); }
+      footer { visibility:hidden; }
+      @media (max-width:700px) {
+        [data-testid='stAppViewBlockContainer'] { padding-left:1rem; padding-right:1rem; }
+        .soptima-hero { padding:1rem; border-radius:16px; }
+        .soptima-hero-icon { width:2.4rem; height:2.4rem; }
+        .metric-card { min-height:auto; }
+      }
+      @media (prefers-reduced-motion:reduce) { * { scroll-behavior:auto!important; transition:none!important; animation:none!important; } }
     </style>
     """, unsafe_allow_html=True)
-    # Start uden indlæste data. Elevdata indlæses først, så elevhold kan bruges som reference.
-    # Ryd kun det gamle indlejrede lærergrundlag ved overgang til den nye starttilstand.
-    if "v2_empty_teacher_start" not in st.session_state:
-        if st.session_state.get("teacher_revision", 0) == 0:
-            st.session_state["teachers"] = []
-            st.session_state["capacities"] = {}
-        st.session_state["v2_empty_teacher_start"] = True
-    load_default_state(load_students=False, load_teachers=False)
     for key, default in (
+        ("students", []),
+        ("teachers", []),
+        ("capacities", {}),
         ("capacity_revision", 0),
         ("student_revision", 0),
         ("teacher_revision", 0),
         ("input_loaded", False),
         ("solution", None),
         ("v2_schedule", None),
-        ("v2_test_students_active", False),
-        ("v2_test_teachers_active", False),
-        ("v2_test_students_checkbox", True),
-        ("v2_test_teachers_checkbox", True),
+        ("v2_schedule_signature", None),
+        ("v2_docx_zip", None),
+        ("v2_stale_notice", ""),
+        ("v2_confirm_demo_restore", False),
+        ("v2_demo_mode", False),
+        ("v2_app_initialized", False),
+        ("v2_startup_error", ""),
     ):
         st.session_state.setdefault(key, default)
+
+    if not st.session_state["v2_app_initialized"]:
+        if not st.session_state["students"] and not st.session_state["teachers"]:
+            try:
+                activate_demo_data()
+            except Exception as error:
+                st.session_state["v2_startup_error"] = f"Demodata kunne ikke indlæses: {error}"
+        st.session_state["v2_app_initialized"] = True
+
+    if st.session_state.get("v2_flash_message"):
+        st.toast(st.session_state.pop("v2_flash_message"), icon="✅")
+    if st.session_state.get("v2_flash_warning"):
+        st.toast(st.session_state.pop("v2_flash_warning"), icon="⚠️")
 
     students = st.session_state["students"]
     teachers = st.session_state["teachers"]
     capacities = st.session_state["capacities"]
     resolve_wishes(students, teachers)
     teacher_map = {teacher["id"]: teacher for teacher in teachers}
+
+    K = int(st.session_state.get("v2_k", 18))
+    double_limit = int(st.session_state.get("v2_double_limit", 0))
+    use_global = bool(st.session_state.get("v2_use_global", True))
+    allow_over = bool(st.session_state.get("v2_allow_over", True))
+    lock_max = bool(st.session_state.get("v2_lock_max", False))
+    prioritize_pairs = bool(st.session_state.get("v2_prioritize_pairs", True))
+    prioritize_classes = bool(st.session_state.get("v2_prioritize_classes", True))
+    attempts = int(st.session_state.get("v2_attempts", 120))
+    current_distribution_signature = distribution_signature(
+        students, teachers, capacities, K, double_limit, use_global, allow_over,
+        lock_max, prioritize_pairs, prioritize_classes, attempts,
+    )
+    existing_solution = st.session_state.get("solution")
+    if existing_solution is not None and existing_solution.get("configuration_signature") != current_distribution_signature:
+        invalidate_derived_state("Indstillingerne eller datagrundlaget er ændret. Beregn en ny fordeling, før resultatet bruges.")
 
     readiness_errors = data_readiness(students, teachers)
     if not students:
@@ -2322,24 +2727,33 @@ def main_v2() -> None:
         "5 · Resultat og eksport",
         "6 · Tidsplan",
     ]
-    K = st.session_state.get("v2_k", 18)
-    double_limit = st.session_state.get("v2_double_limit", 0)
-    use_global = st.session_state.get("v2_use_global", True)
-    allow_over = st.session_state.get("v2_allow_over", True)
-    lock_max = st.session_state.get("v2_lock_max", False)
-    prioritize_pairs = st.session_state.get("v2_prioritize_pairs", True)
-    prioritize_classes = st.session_state.get("v2_prioritize_classes", True)
-    attempts = st.session_state.get("v2_attempts", 120)
+    step_labels = {
+        "1 · Elevdata": "👥  Elevdata",
+        "2 · Lærerdata": "🧑‍🏫  Lærerdata",
+        "3 · Regler og max": "⚙️  Regler og max",
+        "4 · Beregn": "✨  Beregn",
+        "5 · Resultat og eksport": "📊  Resultat og eksport",
+        "6 · Tidsplan": "🗓️  Tidsplan",
+    }
 
     with st.sidebar:
-        st.title("SOPtima")
-        st.caption("Demoversion · fiktive data")
-        st.progress(current_step / 6, text=f"Trin {current_step} af 6")
+        st.markdown(
+            '<div class="soptima-brand"><div class="soptima-brand-icon" aria-hidden="true">S</div>'
+            '<div><div class="soptima-brand-name">SOPtima</div>'
+            '<div class="soptima-brand-sub">Vejlederfordeling og tidsplan</div></div></div>',
+            unsafe_allow_html=True,
+        )
+        st.progress(current_step / 6, text=f"Arbejdsstatus · trin {current_step} af 6")
         st.caption(next_step)
-        active_step = st.radio("Gå til trin", process_steps, index=current_step - 1, key="v2_active_step", label_visibility="collapsed")
-        st.subheader("Status")
+        active_step = st.radio(
+            "Gå til trin",
+            process_steps,
+            index=current_step - 1,
+            key="v2_active_step",
+            label_visibility="collapsed",
+            format_func=lambda step: step_labels[step],
+        )
         if students:
-            student_status = "✅" if not readiness_errors and st.session_state["input_loaded"] else "⚠️"
             student_detail = f"{len(students)} elever"
             if readiness_errors:
                 student_detail += f" · {len(readiness_errors)} fejl"
@@ -2348,63 +2762,73 @@ def main_v2() -> None:
             else:
                 student_detail += " · ikke godkendt"
         else:
-            student_status = "⬜"
             student_detail = "Ikke indlæst"
-        st.caption(f"{student_status} Elevdata · {student_detail}")
         teacher_detail = f"{len(teachers)} lærere" if teachers else "Ikke indlæst"
-        st.caption(f"{'✅' if teachers else '⬜'} Lærerdata · {teacher_detail}")
-        if st.session_state.get("solution") is not None:
-            st.caption("✅ Fordeling beregnet")
+        solution_detail = "Beregnet" if st.session_state.get("solution") is not None else "Ikke beregnet"
+        source_detail = "Fiktive demodata" if st.session_state.get("v2_demo_mode") else "Egne eller redigerede data"
+        st.markdown(
+            '<div class="sidebar-card"><div class="sidebar-card-title">Status</div>'
+            f'<div class="sidebar-row"><span>👥 Elever</span><strong>{html.escape(student_detail)}</strong></div>'
+            f'<div class="sidebar-row"><span>🧑‍🏫 Lærere</span><strong>{html.escape(teacher_detail)}</strong></div>'
+            f'<div class="sidebar-row"><span>✨ Fordeling</span><strong>{html.escape(solution_detail)}</strong></div>'
+            f'<div class="sidebar-row"><span>◉ Datakilde</span><strong>{html.escape(source_detail)}</strong></div></div>',
+            unsafe_allow_html=True,
+        )
         if students and teachers and not readiness_errors and not st.session_state["input_loaded"]:
-            st.success("Data er klar til godkendelse.")
-            if st.button("Godkend data til fordeling", type="primary", key="v2_sidebar_approve_data"):
+            if st.button("✓ Godkend data", type="primary", key="v2_sidebar_approve_data", use_container_width=True):
                 st.session_state["input_loaded"] = True
-                st.session_state["solution"] = None
-                st.session_state["v2_schedule"] = None
+                invalidate_derived_state()
+                st.session_state["v2_stale_notice"] = ""
                 st.rerun()
-        elif students and teachers and st.session_state["input_loaded"]:
-            st.success("Data er godkendt og klar til fordeling.")
         st.divider()
-        st.subheader("Demo-data")
-        st.caption("Alle personer, elever, lærere og opgaver i demoen er fiktive.")
-        test_students_checked = st.checkbox("Indlæs 350 fiktive demoelever", key="v2_test_students_checkbox")
-        test_teachers_checked = st.checkbox("Indlæs 85 fiktive demolærere", key="v2_test_teachers_checkbox")
-        testdata_loaded = False
-        if not test_students_checked:
-            st.session_state["v2_test_students_active"] = False
-        elif not st.session_state["v2_test_students_active"]:
-            try:
-                st.session_state["students"] = parse_students(read_path_table(TEST_STUDENTS_FILE))
-                st.session_state["student_revision"] += 1
-                st.session_state["input_loaded"] = False
-                st.session_state["solution"] = None
-                st.session_state["v2_schedule"] = None
-                st.session_state["v2_test_students_active"] = True
-                testdata_loaded = True
-            except Exception as error:
-                st.error(f"Testelever kunne ikke indlæses: {error}")
-        if not test_teachers_checked:
-            st.session_state["v2_test_teachers_active"] = False
-        elif not st.session_state["v2_test_teachers_active"]:
-            try:
-                parsed_test_teachers, parsed_test_capacities = parse_teachers(read_path_table(TEST_TEACHERS_FILE))
-                st.session_state["teachers"] = parsed_test_teachers
-                st.session_state["capacities"] = {teacher["id"]: parsed_test_capacities.get(teacher["id"], 0) for teacher in parsed_test_teachers}
-                st.session_state["teacher_revision"] += 1
-                st.session_state["capacity_revision"] += 1
-                st.session_state["input_loaded"] = False
-                st.session_state["solution"] = None
-                st.session_state["v2_schedule"] = None
-                st.session_state["v2_test_teachers_active"] = True
-                testdata_loaded = True
-            except Exception as error:
-                st.error(f"Testlærere kunne ikke indlæses: {error}")
-        if testdata_loaded:
-            st.rerun()
-        st.caption("Alt behandles lokalt på denne computer.")
+        st.markdown("#### Demo")
+        st.caption("350 fiktive elever og 85 fiktive lærere indlæses automatisk første gang.")
+        if not st.session_state["v2_confirm_demo_restore"]:
+            if st.button("↻ Gendan demodata", key="v2_restore_demo", use_container_width=True):
+                st.session_state["v2_confirm_demo_restore"] = True
+                st.rerun()
+        else:
+            st.warning("Dette erstatter aktuelle elev- og lærerdata i sessionen.")
+            confirm_columns = st.columns(2)
+            with confirm_columns[0]:
+                if st.button("Gendan", type="primary", key="v2_restore_demo_confirm", use_container_width=True):
+                    try:
+                        activate_demo_data()
+                        st.session_state["v2_confirm_demo_restore"] = False
+                        st.session_state["v2_flash_message"] = "Demodata er gendannet og godkendt."
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"Demodata kunne ikke gendannes: {error}")
+            with confirm_columns[1]:
+                if st.button("Annuller", key="v2_restore_demo_cancel", use_container_width=True):
+                    st.session_state["v2_confirm_demo_restore"] = False
+                    st.rerun()
+        st.caption("Filer behandles kun i den aktuelle app-session. Download dine resultater, før sessionen lukkes.")
+
+    if st.session_state.get("v2_startup_error"):
+        st.error(st.session_state["v2_startup_error"])
+    if st.session_state.get("v2_stale_notice"):
+        st.warning(st.session_state["v2_stale_notice"], icon="⚠️")
+
+    page_meta = {
+        "1 · Elevdata": ("👥", "Datagrundlag", "Elevdata", "Indlæs, kontrollér og tilpas elevernes fag, ønsker og projektoplysninger."),
+        "2 · Lærerdata": ("🧑‍🏫", "Datagrundlag", "Lærerdata", "Indlæs lærernes fag, hold og maksimumstal, og kontrollér at alle elevfag er dækket."),
+        "3 · Regler og max": ("⚙️", "Indstillinger", "Regler og kapacitet", "Fastlæg de rammer, som den endelige vejlederfordeling skal overholde."),
+        "4 · Beregn": ("✨", "Optimering", "Beregn fordeling", "Afprøv flere gyldige fordelinger og vælg automatisk den løsning, der samlet scorer bedst."),
+        "5 · Resultat og eksport": ("📊", "Resultat", "Fordeling og eksport", "Gennemgå kvalitet, belastning og mangler, foretag justeringer og hent resultatet."),
+        "6 · Tidsplan": ("🗓️", "Planlægning", "Tidsplan for vejledning", "Placér vejledninger parallelt uden lærerkonflikter, og tilføj pauser og frokost."),
+    }
+    page_icon, page_kicker, page_title, page_description = page_meta[active_step]
+    source_badge = "● Demo klar" if st.session_state.get("v2_demo_mode") else "● Egne data"
+    st.markdown(
+        f'<section class="soptima-hero"><div class="soptima-hero-icon" aria-hidden="true">{page_icon}</div>'
+        f'<div><div class="soptima-kicker">{html.escape(page_kicker)}</div>'
+        f'<h1>{html.escape(page_title)}</h1><p>{html.escape(page_description)}</p>'
+        f'<span class="source-pill">{html.escape(source_badge)}</span></div></section>',
+        unsafe_allow_html=True,
+    )
 
     if active_step == "2 · Lærerdata":
-        st.title("2 · Lærerdata")
         st.subheader("Indlæs lærerdata")
         if students and teachers and not readiness_errors:
             if st.session_state["input_loaded"]:
@@ -2422,15 +2846,22 @@ def main_v2() -> None:
         teacher_upload = st.file_uploader("Upload lærerdata (.xlsx, .xlsm eller .csv)", type=["xlsx", "xlsm", "csv"], key="v2_teachers_upload")
         if st.button("Indlæs lærerdata", type="primary" if teacher_upload is not None else "secondary", disabled=teacher_upload is None, key="v2_load_teachers"):
             try:
+                replacing_demo = bool(st.session_state.get("v2_demo_mode"))
                 parsed_teachers, parsed_caps = parse_teacher_upload(teacher_upload)
+                if replacing_demo:
+                    st.session_state["students"] = []
+                    st.session_state["student_revision"] += 1
                 st.session_state["teachers"] = parsed_teachers
                 st.session_state["capacities"] = {teacher["id"]: parsed_caps.get(teacher["id"], 0) for teacher in parsed_teachers}
                 st.session_state["teacher_revision"] += 1
                 st.session_state["capacity_revision"] += 1
-                st.session_state["input_loaded"] = False
-                st.session_state["solution"] = None
-                st.session_state["v2_schedule"] = None
-                st.success(f"Lærerdata indlæst: {len(parsed_teachers)} lærere.")
+                invalidate_derived_state(require_approval=True)
+                st.session_state["v2_demo_mode"] = False
+                st.session_state["v2_stale_notice"] = ""
+                st.session_state["v2_flash_message"] = (
+                    f"Lærerdata indlæst: {len(parsed_teachers)} lærere. Demoeleverne er fjernet; indlæs nu elevdata."
+                    if replacing_demo else f"Lærerdata indlæst: {len(parsed_teachers)} lærere."
+                )
                 st.rerun()
             except Exception as error:
                 st.error(str(error))
@@ -2471,14 +2902,18 @@ def main_v2() -> None:
         if json.dumps(new_teachers, sort_keys=True, ensure_ascii=False) != json.dumps(teachers, sort_keys=True, ensure_ascii=False) or new_capacities != capacities:
             st.session_state["teachers"] = new_teachers
             st.session_state["capacities"] = new_capacities
-            st.session_state["input_loaded"] = False
-            st.session_state["solution"] = None
-            st.session_state["v2_schedule"] = None
+            invalidate_derived_state(require_approval=True)
+            st.session_state["v2_demo_mode"] = False
             teachers, capacities = new_teachers, new_capacities
             teacher_map = {teacher["id"]: teacher for teacher in teachers}
         no_subject_teachers = [teacher["id"] for teacher in teachers if not teacher.get("subjects")]
         if no_subject_teachers:
             st.warning(f"{len(no_subject_teachers)} lærer(e) mangler fag og kan ikke få elever: {', '.join(no_subject_teachers)}")
+        zero_capacity_teachers = [teacher_label(teacher["id"], teacher_map) for teacher in teachers if int(capacities.get(teacher["id"], 0)) == 0]
+        if zero_capacity_teachers:
+            preview = ", ".join(zero_capacity_teachers[:8])
+            suffix = " …" if len(zero_capacity_teachers) > 8 else ""
+            st.warning(f"{len(zero_capacity_teachers)} lærer(e) har max 0 og kan ikke få elever: {preview}{suffix}. Ret Max eller brug max-forslaget i trin 3.")
         teacher_data_ready = bool(teachers) and not no_subject_teachers and all(normal_key(teacher.get("id")) for teacher in teachers)
         if teacher_data_ready:
             teacher_export = try_excel_export(
@@ -2502,33 +2937,44 @@ def main_v2() -> None:
                 st.success("Data er godkendt og klar til fordeling.")
             else:
                 if readiness_errors:
-                    st.error("Ret følgende før godkendelse: " + " ".join(readiness_errors[:8]))
+                    st.error(f"Data kan ikke godkendes endnu. Der er {len(readiness_errors)} problem(er), som skal rettes.")
+                    with st.expander("Vis alle problemer", expanded=True):
+                        for error in readiness_errors:
+                            st.markdown(f"- {error}")
                 if st.button("Godkend data til fordeling", type="primary" if not readiness_errors else "secondary", disabled=bool(readiness_errors), key="v2_approve_data"):
                     st.session_state["input_loaded"] = True
-                    st.session_state["solution"] = None
-                    st.session_state["v2_schedule"] = None
-                    st.success("Data er godkendt. Gå videre til fanen Regler og max.")
+                    invalidate_derived_state()
+                    st.session_state["v2_stale_notice"] = ""
+                    st.success("Data er godkendt. Gå videre til trin 3 · Regler og max.")
                     st.rerun()
 
     if active_step == "1 · Elevdata":
-        st.title("1 · Elevdata")
         st.subheader("Indlæs elevdata først")
         with st.expander("Se eksempel på elevarket (kun illustration)", expanded=False):
             st.dataframe(pd.DataFrame([
                 {"Elevnavn": "Emma Jensen", "Klasse": "3a", "Fag 1": "Matematik", "Fag 2": "Fysik", "Ønskevejleder 1": "AB", "Ønskevejleder 2": "CD"},
                 {"Elevnavn": "Noah Hansen", "Klasse": "3a", "Fag 1": "Dansk", "Fag 2": "Historie", "Ønskevejleder 1": "CD", "Ønskevejleder 2": ""},
             ]), width="stretch", hide_index=True)
-            st.caption("Format: Elevnavn, Klasse og Fag 1–2. Ønskevejledere er valgfri.")
+            st.caption("Format: Elevnavn og Fag 1–2 er påkrævet. Klasse/Hold og ønskevejledere er valgfri; en manglende klasse vises som ukendt.")
         st.caption("Første skridt: vælg en elevfil.")
         student_upload = st.file_uploader("Upload elevdata (.xlsx, .xlsm eller .csv)", type=["xlsx", "xlsm", "csv"], key="v2_students_upload")
         if st.button("Indlæs elevdata", type="primary" if student_upload is not None else "secondary", disabled=student_upload is None, key="v2_load_students"):
             try:
+                replacing_demo = bool(st.session_state.get("v2_demo_mode"))
                 st.session_state["students"] = parse_students(read_uploaded_table(student_upload))
+                if replacing_demo:
+                    st.session_state["teachers"] = []
+                    st.session_state["capacities"] = {}
+                    st.session_state["teacher_revision"] += 1
+                    st.session_state["capacity_revision"] += 1
                 st.session_state["student_revision"] += 1
-                st.session_state["input_loaded"] = False
-                st.session_state["solution"] = None
-                st.session_state["v2_schedule"] = None
-                st.success(f"Elevdata indlæst: {len(st.session_state['students'])} elever.")
+                invalidate_derived_state(require_approval=True)
+                st.session_state["v2_demo_mode"] = False
+                st.session_state["v2_stale_notice"] = ""
+                st.session_state["v2_flash_message"] = (
+                    f"Elevdata indlæst: {len(st.session_state['students'])} elever. Demolærerne er fjernet; indlæs nu lærerdata."
+                    if replacing_demo else f"Elevdata indlæst: {len(st.session_state['students'])} elever."
+                )
                 st.rerun()
             except Exception as error:
                 st.error(str(error))
@@ -2546,8 +2992,8 @@ def main_v2() -> None:
             resolve_wishes(new_students, teachers)
             if student_data_signature(new_students) != student_data_signature(students):
                 st.session_state["students"] = new_students
-                st.session_state["input_loaded"] = False
-                st.session_state["solution"] = None
+                invalidate_derived_state(require_approval=True)
+                st.session_state["v2_demo_mode"] = False
                 students = new_students
         except ValueError as error:
             st.error(str(error))
@@ -2559,10 +3005,13 @@ def main_v2() -> None:
             unknown_frame = pd.DataFrame(validation["unknown_wishes"]).drop_duplicates()
             st.warning(f"{len(unknown_frame)} ønsker kan ikke genkendes. Vælg en lærer eller **Ingen ønsker** i elevarket:")
             st.dataframe(unknown_frame, width="stretch", hide_index=True)
+        if validation["ambiguous_wishes"]:
+            st.warning("Disse ønsker matcher flere lærere med samme navn. Vælg læreren med initialer:")
+            st.dataframe(pd.DataFrame(validation["ambiguous_wishes"]), width="stretch", hide_index=True)
         if validation["missing_subjects"]:
             st.warning("Disse elevfag har ingen lærer endnu:")
             st.dataframe(pd.DataFrame(validation["missing_subjects"]).drop_duplicates(), width="stretch", hide_index=True)
-        if validation["incompatible_wishes"] or validation["unknown_wishes"]:
+        if validation["incompatible_wishes"] or validation["unknown_wishes"] or validation["ambiguous_wishes"]:
             if validation["incompatible_wishes"]:
                 st.warning("Disse ønskede lærere underviser ikke i elevens fag:")
                 st.dataframe(pd.DataFrame(validation["incompatible_wishes"]).drop_duplicates(), width="stretch", hide_index=True)
@@ -2614,16 +3063,15 @@ def main_v2() -> None:
                     elif changes:
                         for student_index, wishes in changed_wishes.items():
                             students[student_index]["wishes"] = [wish for wish in wishes if wish]
-                        st.session_state["input_loaded"] = False
-                        st.session_state["solution"] = None
-                        st.session_state["v2_schedule"] = None
+                        invalidate_derived_state(require_approval=True)
+                        st.session_state["v2_demo_mode"] = False
                         st.success(f"{changes} ønske(r) er opdateret med de valgte lærere.")
                         st.rerun()
         if validation["partial_wishes"]:
             st.caption(f"{len(validation['partial_wishes'])} ønsker matcher kun ét af elevens fag.")
             with st.expander("Se ønsker med delvist fagmatch"):
                 st.dataframe(pd.DataFrame(validation["partial_wishes"]).drop_duplicates(), width="stretch", hide_index=True)
-        if students and not any(validation[key] for key in ("unknown_wishes", "missing_subjects", "incompatible_wishes")):
+        if students and not any(validation[key] for key in ("unknown_wishes", "ambiguous_wishes", "missing_subjects", "incompatible_wishes")):
             st.success("Elevønsker, elevfag og lærernes fag ser konsistente ud.")
         if students and teachers:
             st.subheader("Kontrol: har hvert fag en mulig lærer?")
@@ -2632,10 +3080,22 @@ def main_v2() -> None:
         input_export = try_excel_export(lambda: make_input_export(students, teachers, capacities))
         if input_export is not None:
             st.download_button("Download aktuelle inputark som Excel", data=input_export, file_name="vejlederfordeling_input.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="v2_download_input")
+        readiness_errors = data_readiness(students, teachers)
+        if students and teachers and not readiness_errors and not st.session_state["input_loaded"]:
+            st.divider()
+            st.markdown("#### Klar til næste trin")
+            st.caption("Data er konsistente. Godkend dem for at låse datagrundlaget til den næste beregning.")
+            st.button(
+                "Godkend data og fortsæt",
+                type="primary",
+                key="v2_approve_from_students",
+                on_click=approve_data_and_navigate,
+                args=("3 · Regler og max",),
+            )
 
     if active_step == "3 · Regler og max":
-        st.title("3 · Regler og max")
         st.subheader("Fordelingsregler")
+        st.markdown('<div class="section-note"><strong>Sådan hænger reglerne sammen:</strong> K er den absolutte globale grænse. Lærerens eget max er den normale grænse. En overskridelse af lærerens max kan kun ske op til K, når den er tilladt og max ikke er låst. I begrænser dobbeltvejledninger.</div>', unsafe_allow_html=True)
         rule_cols = st.columns(2)
         with rule_cols[0]:
             use_global = st.checkbox("Brug global K-grænse", value=True, key="v2_use_global")
@@ -2668,9 +3128,9 @@ def main_v2() -> None:
                 update_algorithm_progress(progress_bar, "Max-forslag færdigt", 1.0)
                 st.session_state["capacities"] = dict(suggestion["loads"])
                 st.session_state["capacity_revision"] += 1
-                st.session_state["solution"] = None
-                st.session_state["v2_schedule"] = None
-                st.success("Forslag til lærernes max-tal er indsat. Kontrollér og tilpas dem efter behov.")
+                invalidate_derived_state("Max-tallene er opdateret. Beregn fordelingen igen efter din kontrol.")
+                st.session_state["v2_demo_mode"] = False
+                st.session_state["v2_flash_message"] = "Forslag til lærernes max-tal er indsat. Kontrollér og tilpas dem efter behov."
                 st.rerun()
         with max_action_cols[1]:
             st.caption("Forslaget fordeler belastningen så jævnt som muligt. Kontrollér altid tallene, før du beregner den endelige fordeling.")
@@ -2682,80 +3142,137 @@ def main_v2() -> None:
             pd.DataFrame(capacity_rows), width="stretch", hide_index=True, disabled=["Lærer", "Initialer", "Fag"],
             column_config={"Max": st.column_config.NumberColumn("Max", min_value=0, max_value=50, step=1, required=True)}, key="v2_capacity_editor",
         )
+        capacities_before_edit = dict(capacities)
         for _, row in edited_capacities.iterrows():
             teacher_id = normal_key(row["Initialer"])
             if teacher_id in capacities:
                 capacities[teacher_id] = max(0, min(50, int(row["Max"] or 0)))
+        if capacities != capacities_before_edit:
+            st.session_state["capacities"] = capacities
+            invalidate_derived_state("Lærernes max-tal er ændret. Beregn en ny fordeling for at få et aktuelt resultat.")
+            st.session_state["v2_demo_mode"] = False
 
     can_calculate = st.session_state["input_loaded"] and not data_readiness(students, teachers)
     if active_step == "4 · Beregn":
-        st.title("4 · Beregn")
         st.subheader("Beregn fordeling")
+        summary_columns = st.columns(4)
+        summary_columns[0].metric("Elever", len(students))
+        summary_columns[1].metric("Lærere", len(teachers))
+        summary_columns[2].metric("Global K", K if use_global else "Fra")
+        summary_columns[3].metric("Dobbeltvejledning I", double_limit)
+        with st.expander("Kontrollér indstillinger før beregning", expanded=False):
+            st.write(
+                f"**Kapacitetsregel:** {'Global K = ' + str(K) if use_global else 'Lærernes egne max-tal'} · "
+                f"**Overskridelse op til K:** {'Ja' if use_global and allow_over and not lock_max else 'Nej'} · "
+                f"**Låste max-tal:** {'Ja' if lock_max else 'Nej'} · **Algoritmedybde:** {attempts}"
+            )
+            st.write(f"**Prioritér lærerpar:** {'Ja' if prioritize_pairs else 'Nej'} · **Saml klasser/hold:** {'Ja' if prioritize_classes else 'Nej'}")
         if not st.session_state["input_loaded"]:
-            st.warning("Godkend først data i fanen Elevdata.")
+            st.warning("Godkend først data i trin 1 eller 2.")
         elif not can_calculate:
-            st.error("Fordeling er låst, fordi data ikke er på korrekt form.")
+            calculation_errors = data_readiness(students, teachers)
+            st.error("Fordeling er låst, fordi datagrundlaget indeholder fejl.")
+            with st.expander("Vis fejl i datagrundlaget", expanded=True):
+                for error in calculation_errors:
+                    st.markdown(f"- {error}")
         else:
             st.success("Data er godkendt. Du kan beregne fordelingen.")
         if st.button("Beregn fordeling", type="primary" if can_calculate else "secondary", key="v2_calculate", disabled=not can_calculate):
             progress_bar = st.progress(0.0, text="Beregner fordeling: 0 %")
             with st.spinner("Beregner flere mulige fordelinger …"):
-                st.session_state["solution"] = optimize(
+                calculated_solution = optimize(
                     students, teachers, capacities, K, double_limit, use_global, allow_over, lock_max,
                     prioritize_pairs, prioritize_classes, attempts,
                     progress_callback=lambda value: update_algorithm_progress(progress_bar, "Beregner fordeling", value),
                 )
-                st.session_state["v2_schedule"] = None
+                calculated_solution["configuration_signature"] = distribution_signature(
+                    students, teachers, capacities, K, double_limit, use_global, allow_over,
+                    lock_max, prioritize_pairs, prioritize_classes, attempts,
+                )
+                assessment = assignment_assessment(
+                    students, teachers, capacities, calculated_solution["assignments"], K, double_limit,
+                    use_global, allow_over, lock_max,
+                )
+                if assessment["errors"]:
+                    st.session_state["solution"] = None
+                    st.error("Fordelingen bestod ikke den afsluttende regelkontrol: " + " ".join(assessment["errors"][:8]))
+                else:
+                    st.session_state["solution"] = calculated_solution
+                    st.session_state["v2_stale_notice"] = ""
+                    st.session_state["v2_schedule"] = None
+                    st.session_state["v2_schedule_signature"] = None
             update_algorithm_progress(progress_bar, "Fordeling færdig", 1.0)
-            st.success("Fordelingen er beregnet. Gå til fanen Resultat og eksport eller Tidsplan.")
+            if st.session_state.get("solution") is not None:
+                st.success("Fordelingen er beregnet og regelkontrolleret. Gå til trin 5 for at gennemgå resultatet.")
 
     if active_step == "5 · Resultat og eksport":
-        st.title("5 · Resultat og eksport")
         solution = st.session_state.get("solution")
         st.subheader("Resultat og eksport")
         if solution is None:
-            st.caption("Beregn først en fordeling i menuen.")
+            if st.session_state.get("v2_stale_notice"):
+                st.info("Resultatet er fjernet, fordi grundlaget er ændret. Gå til trin 4 og beregn igen.")
+            else:
+                st.info("Der er endnu ikke et resultat. Gå til trin 4 · Beregn.")
         else:
             stats = solution["stats"]
+            result_assessment = assignment_assessment(
+                students, teachers, capacities, solution["assignments"], solution["K"], solution["double_limit"],
+                solution["use_global_k"], solution.get("allow_over_capacity", False), solution.get("lock_teacher_max", False),
+            )
+            if result_assessment["errors"]:
+                st.error("Fordelingen har kritiske regelbrud: " + " ".join(result_assessment["errors"][:8]))
+            elif stats["unassigned"] == 0 and not result_assessment["warnings"]:
+                st.success("Fordelingen er komplet og overholder alle valgte hårde grænser.", icon="✅")
             if stats["unassigned"] or stats["over_teachers"] or stats["capacity_blocked_slots"]:
                 messages = []
                 if stats["unassigned"]: messages.append(f"{stats['unassigned']} elever mangler mindst én vejleder.")
                 if stats["capacity_blocked_slots"]: messages.append(f"{stats['capacity_blocked_slots']} fagpladser blev blokeret af lærermax.")
-                if stats["over_teachers"]: messages.append(f"{stats['over_teachers']} lærere ligger over deres individuelle max.")
+                if stats["over_teachers"]: messages.append(f"{stats['over_teachers']} lærere ligger over deres normale individuelle max; kontrollér at dette er tilsigtet.")
                 st.warning(" ".join(messages))
-            metric_data = [(len(students) - stats["unassigned"], "Elever fordelt"), (stats["both"], "Begge ønsker"), (stats["one"] + stats["both"], "Mindst ét ønske"), (stats["none"], "Ingen ønsker"), (stats["capacity_blocked_students"], "Kapacitetsblokerede")]
+            metric_data = [(len(students) - stats["unassigned"], "Elever komplet fordelt"), (stats.get("all_wishes", stats["both"]), "Alle ønsker opfyldt"), (stats["one"] + stats["both"], "Mindst ét ønske opfyldt"), (stats["none"], "Uden opfyldt ønske"), (stats["capacity_blocked_students"], "Kapacitetsblokerede")]
             cols = st.columns(5)
             for column, (value, label) in zip(cols, metric_data):
                 column.markdown(f'<div class="metric-card"><span class="metric-value">{value}</span><span class="metric-label">{label}</span></div>', unsafe_allow_html=True)
+            st.caption(f"Ønskestatistikken omfatter {stats.get('wish_students', len(students))} elever med mindst ét angivet lærerønske. {stats.get('no_wishes', 0)} elever har ikke angivet ønsker.")
             export_sheet_options = ["Fordeling", "Lærerbelastning", "Fagstatistik", "Ikke tildelte", "Elevdata", "Lærerdata"]
             selected_export_sheets = st.multiselect("Vælg ark til Excel-filen", export_sheet_options, default=export_sheet_options[:4], key="v2_export_sheets")
             result_export = try_excel_export(lambda: make_export(students, teachers, solution, capacities, solution["use_global_k"], selected_export_sheets)) if selected_export_sheets else None
             if result_export is not None:
                 st.download_button("Download fordeling som Excel", data=result_export, file_name="vejlederfordeling.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", key="v2_download_result")
+            elif not selected_export_sheets:
+                st.info("Vælg mindst ét ark for at aktivere Excel-download.")
 
             result_students, result_teachers, result_subjects, result_missing = st.tabs(["Fordeling", "Lærere", "Fagstatistik", "Ikke tildelte"])
             with result_students:
                 rows = []
                 for index, student in enumerate(students):
                     assigned = solution["assignments"][index]
-                    rows.append({"Elev": student["name"], "Klasse": student.get("className", ""), "Fag 1": student["subjects"][0], "Vejleder 1": teacher_label(assigned[0], teacher_map), "Fag 2": student["subjects"][1], "Vejleder 2": teacher_label(assigned[1], teacher_map), "Ønsker": f"{wished_count(student, assigned)}/2"})
+                    rows.append({"Elev": student["name"], "Klasse": student.get("className", ""), "Fag 1": student["subjects"][0], "Vejleder 1": teacher_label(assigned[0], teacher_map), "Fag 2": student["subjects"][1], "Vejleder 2": teacher_label(assigned[1], teacher_map), "Ønsker opfyldt": wish_status_label(student, assigned)})
                 st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, height=560)
             with result_teachers:
                 rows = []
                 for teacher in sorted(teachers, key=lambda item: (-solution["loads"].get(item["id"], 0), item["id"])):
                     teacher_id = teacher["id"]
-                    limit = min(solution["K"], capacities.get(teacher_id, 0)) if solution["use_global_k"] else capacities.get(teacher_id, 0)
-                    rows.append({"Lærer": teacher_label(teacher_id, teacher_map), "Initialer": teacher_id, "Fag": " · ".join(teacher["subjects"]), "Elever": solution["loads"].get(teacher_id, 0), "Max": limit, "Status": "Over max" if solution["loads"].get(teacher_id, 0) > limit else "OK"})
+                    individual_limit = int(capacities.get(teacher_id, 0))
+                    normal_limit = min(solution["K"], individual_limit) if solution["use_global_k"] else individual_limit
+                    permit_over = solution["use_global_k"] and solution.get("allow_over_capacity", False) and not solution.get("lock_teacher_max", False)
+                    hard_limit = solution["K"] if permit_over else normal_limit
+                    load = solution["loads"].get(teacher_id, 0)
+                    status = "BRUD" if load > hard_limit else "Tilladt over eget max" if load > normal_limit else "OK"
+                    rows.append({"Lærer": teacher_label(teacher_id, teacher_map), "Initialer": teacher_id, "Fag": " · ".join(teacher["subjects"]), "Elever": load, "Eget max": individual_limit, "Hård grænse": hard_limit, "Status": status})
                 st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, height=560)
             with result_subjects:
-                st.dataframe(subject_stats(students, teachers, capacities, solution["K"], solution["use_global_k"]), width="stretch", hide_index=True)
+                st.dataframe(subject_stats(students, teachers, capacities, solution["K"], solution["use_global_k"], solution.get("allow_over_capacity", False), solution.get("lock_teacher_max", False)), width="stretch", hide_index=True)
             with result_missing:
                 missing = [{"Elev": student["name"], "Klasse": student.get("className", ""), "Fag": student["subjects"][slot], "Status": "Mangler vejleder"} for index, student in enumerate(students) for slot in (0, 1) if not solution["assignments"][index][slot]]
-                st.dataframe(pd.DataFrame(missing), width="stretch", hide_index=True)
+                if missing:
+                    st.dataframe(pd.DataFrame(missing), width="stretch", hide_index=True)
+                else:
+                    st.success("Alle elever har to vejledere.")
             with st.expander("Manuel justering af vejledere"):
-                st.caption("Vælg en anden lærer i dropdownen. Kun lærere, der underviser i det valgte fag, accepteres. Vælg **Ingen ønsker** for at fjerne en tildeling.")
-                assignment_options = [NO_WISHES_LABEL] + sorted((teacher_label(teacher["id"], teacher_map) for teacher in teachers), key=str.casefold)
-                edit_rows = [{"Elev": student["name"], "Fag 1": student["subjects"][0], "Vejleder 1": teacher_label(solution["assignments"][index][0], teacher_map) if solution["assignments"][index][0] else NO_WISHES_LABEL, "Fag 2": student["subjects"][1], "Vejleder 2": teacher_label(solution["assignments"][index][1], teacher_map) if solution["assignments"][index][1] else NO_WISHES_LABEL} for index, student in enumerate(students)]
+                st.caption("Vælg en anden lærer i dropdownen. Ved gemning kontrolleres fagmatch, K, lærernes max og I-grænsen. Vælg **Ingen vejleder** for at fjerne en tildeling.")
+                assignment_options = [UNASSIGNED_LABEL] + sorted((teacher_label(teacher["id"], teacher_map) for teacher in teachers), key=str.casefold)
+                edit_rows = [{"Elev": student["name"], "Fag 1": student["subjects"][0], "Vejleder 1": teacher_label(solution["assignments"][index][0], teacher_map) if solution["assignments"][index][0] else UNASSIGNED_LABEL, "Fag 2": student["subjects"][1], "Vejleder 2": teacher_label(solution["assignments"][index][1], teacher_map) if solution["assignments"][index][1] else UNASSIGNED_LABEL} for index, student in enumerate(students)]
                 edited = st.data_editor(
                     pd.DataFrame(edit_rows), width="stretch", hide_index=True, disabled=["Elev", "Fag 1", "Fag 2"],
                     column_config={
@@ -2772,7 +3289,7 @@ def main_v2() -> None:
                         values = []
                         for slot in (1, 2):
                             selected = repair_text(row[f"Vejleder {slot}"])
-                            teacher_id = None if not selected or normal_key(selected) == normal_key(NO_WISHES_LABEL) else label_to_id.get(normal_key(selected), normal_key(selected))
+                            teacher_id = None if not selected or normal_key(selected) == normal_key(UNASSIGNED_LABEL) else label_to_id.get(normal_key(selected), normal_key(selected))
                             subject = students[index]["subjects"][slot - 1]
                             if teacher_id and teacher_id not in candidates.get(canonical_subject(subject), []):
                                 errors.append(f"{students[index]['name']}: {selected} underviser ikke i {subject} eller findes ikke i lærerlisten.")
@@ -2780,21 +3297,26 @@ def main_v2() -> None:
                             else:
                                 values.append(teacher_id)
                         assignments.append(values)
+                    manual_assessment = assignment_assessment(
+                        students, teachers, capacities, assignments, solution["K"], solution["double_limit"],
+                        solution["use_global_k"], solution.get("allow_over_capacity", False), solution.get("lock_teacher_max", False),
+                    )
+                    errors.extend(manual_assessment["errors"])
                     if errors:
                         st.error(" ".join(errors[:8]))
                     else:
                         solution["assignments"] = assignments
-                        solution["loads"] = {teacher_id: 0 for teacher_id in teacher_map}
-                        solution["double_loads"] = {teacher_id: 0 for teacher_id in teacher_map}
-                        for assigned in assignments:
-                            for teacher_id in set(item for item in assigned if item):
-                                solution["loads"][teacher_id] += 1
-                            if assigned[0] and assigned[0] == assigned[1]:
-                                solution["double_loads"][assigned[0]] += 1
+                        solution["loads"] = manual_assessment["loads"]
+                        solution["double_loads"] = manual_assessment["double_loads"]
                         solution["stats"] = score_solution(students, teachers, capacities, assignments, solution["loads"], solution["K"], solution["use_global_k"], prioritize_pairs, prioritize_classes)
                         st.session_state["solution"] = solution
                         st.session_state["v2_schedule"] = None
-                        st.success("Fordelingen er opdateret.")
+                        st.session_state["v2_schedule_signature"] = None
+                        st.session_state["v2_docx_zip"] = None
+                        if manual_assessment["warnings"]:
+                            st.session_state["v2_flash_warning"] = "Fordelingen er gemt med advarsel: " + " ".join(manual_assessment["warnings"][:5])
+                        else:
+                            st.session_state["v2_flash_message"] = "Fordelingen er opdateret og regelkontrolleret."
                         st.rerun()
             st.divider()
             if st.button("Forbered Word-filer", key="v2_prepare_docx"):
@@ -2807,9 +3329,8 @@ def main_v2() -> None:
                 st.download_button("Download SOP-filer (.zip)", data=st.session_state["v2_docx_zip"], file_name="SOP-filer.zip", mime="application/zip", key="v2_download_docx")
 
     if active_step == "6 · Tidsplan":
-        st.title("6 · Tidsplan for vejledning")
-        st.subheader("Upload godkendt lærer- og elevliste")
-        st.caption("Upload den færdige liste med én række pr. elev. Listen bruges direkte — du behøver ikke først indlæse eller beregne en fordeling i trin 1-5.")
+        st.subheader("1 · Vælg datagrundlag")
+        st.caption("Brug den aktuelle beregnede fordeling, eller upload en færdig, godkendt liste. En uploadet liste har forrang og markeres tydeligt som aktiv kilde.")
         schedule_upload = st.file_uploader(
             "Godkendt liste (.xlsx eller .xlsm)",
             type=["xlsx", "xlsm"],
@@ -2834,31 +3355,32 @@ def main_v2() -> None:
         if schedule_upload is not None:
             try:
                 uploaded_schedule = parse_schedule_upload(schedule_upload)
-                st.success(
-                    f"Excel klar: {len(uploaded_schedule['students'])} elever og "
-                    f"{len(uploaded_schedule['teachers'])} lærere fundet."
-                )
             except (ValueError, ImportError) as error:
                 st.error(str(error))
 
         solution = st.session_state.get("solution")
+        schedule_source_ready = False
         if uploaded_schedule is not None:
             schedule_students_source = uploaded_schedule["students"]
             schedule_teachers_source = uploaded_schedule["teachers"]
             schedule_solution_source = uploaded_schedule["solution"]
-            st.success(
-                f"Godkendt liste klar: {len(uploaded_schedule['students'])} elever og "
-                f"{len(uploaded_schedule['teachers'])} lærere. Vælg tider, varighed og pauser nedenfor."
-            )
+            schedule_source_ready = True
+            st.success(f"Aktiv kilde: **{uploaded_schedule['source_name']}** · {len(uploaded_schedule['students'])} elever · {len(uploaded_schedule['teachers'])} lærere.")
         elif solution is None:
-            st.info("Upload en godkendt liste her, eller beregn først en fordeling i fanen Beregn.")
+            st.info("Upload en godkendt liste her, eller beregn først en fordeling i trin 4.")
         else:
             schedule_students_source = students
             schedule_teachers_source = teachers
             schedule_solution_source = solution
+            missing_schedule_assignments = sum(any(not teacher_id for teacher_id in assigned) for assigned in solution.get("assignments", []))
+            schedule_source_ready = missing_schedule_assignments == 0
+            st.success(f"Aktiv kilde: **Aktuel beregnet fordeling** · {len(students)} elever · {len(teachers)} lærere.")
             st.caption("Hver elev får én samlet vejledningstid med sine tildelte vejledere. Brug Elevplanen som elevens opslag og Lærerplanen som lærerens dagsorden.")
+            if missing_schedule_assignments:
+                st.error(f"{missing_schedule_assignments} elev(er) mangler en komplet vejlederfordeling. Ret dem i trin 5, før tidsplanen genereres.")
 
         if uploaded_schedule is not None or solution is not None:
+            st.subheader("2 · Indstil dagen")
             time_columns = st.columns(4)
             with time_columns[0]:
                 schedule_start = st.time_input("Starttidspunkt", value=dt_time(9, 0), key="v2_schedule_start")
@@ -2903,7 +3425,20 @@ def main_v2() -> None:
                 key="v2_schedule_depth",
                 help="Algoritmen afprøver forskellige måder at placere uafhængige lærerpar parallelt. En højere værdi kan give færre vejledningsrunder, men tager længere tid.",
             )
-            if st.button("Generér tidsplan" if uploaded_schedule is not None else "Lav eller opdater tidsplan", type="primary", key="v2_make_schedule"):
+            current_schedule_signature = schedule_signature(
+                schedule_students_source,
+                schedule_teachers_source,
+                schedule_solution_source,
+                [schedule_start, schedule_end, int(schedule_student_minutes), int(schedule_pause_count),
+                 int(schedule_pause_minutes), int(schedule_transition_minutes), bool(schedule_group_pairs),
+                 schedule_lunch_mode, schedule_lunch_start, int(schedule_lunch_minutes), int(schedule_depth)],
+            )
+            if st.session_state.get("v2_schedule") is not None and st.session_state.get("v2_schedule_signature") != current_schedule_signature:
+                st.session_state["v2_schedule"] = None
+                st.session_state["v2_schedule_signature"] = None
+                st.info("Tidsindstillingerne eller datakilden er ændret. Generér planen igen for at se et aktuelt resultat.")
+            st.subheader("3 · Generér og kontrollér")
+            if st.button("Generér tidsplan" if uploaded_schedule is not None else "Lav eller opdater tidsplan", type="primary", key="v2_make_schedule", disabled=not schedule_source_ready):
                 try:
                     progress_bar = st.progress(0.0, text="Beregner tidsplan: 0 %")
                     st.session_state["v2_schedule"] = make_schedule(
@@ -2923,10 +3458,12 @@ def main_v2() -> None:
                         search_attempts=int(schedule_depth),
                         progress_callback=lambda value: update_algorithm_progress(progress_bar, "Beregner tidsplan", value),
                     )
+                    st.session_state["v2_schedule_signature"] = current_schedule_signature
                     update_algorithm_progress(progress_bar, "Tidsplan færdig", 1.0)
                     st.success("Tidsplanen er genereret fra Excel-filen." if uploaded_schedule is not None else "Tidsplanen er opdateret.")
                 except ValueError as error:
                     st.session_state["v2_schedule"] = None
+                    st.session_state["v2_schedule_signature"] = None
                     st.error(str(error))
             schedule = st.session_state.get("v2_schedule")
             if schedule is not None:
@@ -2977,6 +3514,30 @@ def main_v2() -> None:
                         )
                     else:
                         st.error("Excel-download kræver openpyxl. Installer projektets requirements.txt for at aktivere eksporten.")
+
+    st.divider()
+    active_index = process_steps.index(active_step)
+    navigation_columns = st.columns([1, 2, 1])
+    with navigation_columns[0]:
+        if active_index > 0:
+            st.button(
+                f"← {step_labels[process_steps[active_index - 1]].strip()}",
+                key="v2_previous_step",
+                use_container_width=True,
+                on_click=navigate_to_step,
+                args=(process_steps[active_index - 1],),
+            )
+    with navigation_columns[1]:
+        st.caption(f"Du er i trin {active_index + 1} af 6. Du kan altid gå direkte til et trin i venstremenuen.")
+    with navigation_columns[2]:
+        if active_index < len(process_steps) - 1:
+            st.button(
+                f"{step_labels[process_steps[active_index + 1]].strip()} →",
+                key="v2_next_step",
+                use_container_width=True,
+                on_click=navigate_to_step,
+                args=(process_steps[active_index + 1],),
+            )
 
 
 if __name__ == "__main__":
