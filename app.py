@@ -864,6 +864,112 @@ def _schedule_pair_label(teacher_ids: tuple[str, ...], teacher_map: dict[str, di
     return " + ".join(teacher_label(teacher_id, teacher_map) for teacher_id in teacher_ids) or "Mangler vejleder"
 
 
+def _round_order_metrics(
+    round_order: list[int],
+    round_teachers: list[set[str]],
+    round_pairs: list[set[tuple[str, ...]]] | None = None,
+) -> tuple[int, int]:
+    """Beregn antal lærerhuller og sammenhængende lærerpar for en rækkefølge."""
+    positions = {round_number: position for position, round_number in enumerate(round_order)}
+    teacher_positions: dict[str, list[int]] = defaultdict(list)
+    for round_number, teachers_in_round in enumerate(round_teachers):
+        position = positions[round_number]
+        for teacher_id in teachers_in_round:
+            teacher_positions[teacher_id].append(position)
+    gap_rounds = sum(
+        max(positions_for_teacher) - min(positions_for_teacher) + 1 - len(positions_for_teacher)
+        for positions_for_teacher in teacher_positions.values()
+        if len(positions_for_teacher) > 1
+    )
+    pair_affinity = 0
+    if round_pairs is not None:
+        pair_affinity = sum(
+            len(round_pairs[left] & round_pairs[right])
+            for left, right in zip(round_order, round_order[1:])
+        )
+    return gap_rounds, pair_affinity
+
+
+def _optimise_teacher_round_order(
+    round_teachers: list[set[str]],
+    initial_order: list[int],
+    round_pairs: list[set[tuple[str, ...]]] | None = None,
+) -> list[int]:
+    """Forsøg at samle hver lærers runder ved at optimere rækkefølgen af runder.
+
+    Runderne ændres ikke, og dermed ændres hverken konfliktfriheden eller antallet
+    af runder. Det er en heuristik, fordi den eksakte rækkefølgeoptimering ellers
+    bliver unødigt dyr for store tidsplaner.
+    """
+    if len(initial_order) < 2:
+        return initial_order[:]
+
+    def score(order: list[int]) -> tuple[int, int]:
+        gaps, affinity = _round_order_metrics(order, round_teachers, round_pairs)
+        return gaps, -affinity
+
+    def greedy_order(start: int) -> list[int]:
+        remaining = set(initial_order)
+        remaining.remove(start)
+        order = [start]
+        seen_teachers = set(round_teachers[start])
+        while remaining:
+            previous = order[-1]
+
+            def candidate_key(round_number: int) -> tuple[int, int, int, int]:
+                current_teachers = round_teachers[round_number]
+                # Fortsæt først med lærere fra den foregående runde. En lærer,
+                # der allerede har været aktiv, men ikke er aktiv nu, tæller som
+                # et sandsynligt hul, hvis den dukker op igen.
+                overlap = len(round_teachers[previous] & current_teachers)
+                stale = len((seen_teachers - round_teachers[previous]) & current_teachers)
+                affinity = (
+                    len(round_pairs[previous] & round_pairs[round_number])
+                    if round_pairs is not None
+                    else 0
+                )
+                return stale, -overlap, -affinity, round_number
+
+            next_round = min(remaining, key=candidate_key)
+            order.append(next_round)
+            remaining.remove(next_round)
+            seen_teachers.update(round_teachers[next_round])
+        return order
+
+    # Brug den eksisterende rækkefølge som kandidat og suppler med nogle
+    # forskellige greedy-starter. Det giver flere muligheder uden at gøre
+    # tidsplanberegningen uforholdsmæssigt langsom.
+    starts = [initial_order[0], initial_order[-1]]
+    starts.extend(initial_order[:: max(1, len(initial_order) // 8)])
+    candidate_orders = [initial_order[:], list(reversed(initial_order))]
+    candidate_orders.extend(greedy_order(start) for start in dict.fromkeys(starts))
+    best_order = min(candidate_orders, key=score)
+    best_score = score(best_order)
+
+    # Flytning af én hel runde kan lukke et hul, som simple naboombytninger ikke
+    # kan finde. Begræns søgningen til den almindelige størrelse for en tidsplan;
+    # ved meget store planer er greedy-resultatet stadig en gyldig forbedring.
+    if len(best_order) <= 120:
+        improved = True
+        while improved:
+            improved = False
+            for source in range(len(best_order)):
+                for target in range(len(best_order)):
+                    if source == target or abs(source - target) < 2:
+                        continue
+                    candidate = best_order[:]
+                    moved = candidate.pop(source)
+                    candidate.insert(target, moved)
+                    candidate_score = score(candidate)
+                    if candidate_score < best_score:
+                        best_order, best_score = candidate, candidate_score
+                        improved = True
+                        break
+                if improved:
+                    break
+    return best_order
+
+
 def make_schedule(
     students: list[dict[str, Any]],
     teachers: list[dict[str, Any]],
@@ -880,6 +986,7 @@ def make_schedule(
     lunch_minutes: int = 30,
     search_attempts: int = 80,
     progress_callback: Any = None,
+    avoid_teacher_gaps: bool = False,
 ) -> dict[str, Any]:
     """Lav en parallel vejledningsplan ud fra den aktuelle fordeling."""
     if start_time >= end_time:
@@ -936,6 +1043,8 @@ def make_schedule(
     lower_bound = max(len(session_indexes) for session_indexes in teacher_sessions.values())
     best_colors: list[int] | None = None
     best_colour_count = len(ordered_sessions) + 1
+    best_gap_score: int | None = None
+    best_round_order: list[int] | None = None
     coloring_attempts = max(1, search_attempts)
     for attempt_index in range(coloring_attempts):
         rng = __import__("random").Random(20260913 + attempt_index)
@@ -958,20 +1067,44 @@ def make_schedule(
                 if other in uncoloured:
                     saturation[other].add(colour)
         colour_count = max(colors) + 1
-        if colour_count < best_colour_count:
+        candidate_round_order = list(range(colour_count))
+        candidate_gap_score = None
+        if avoid_teacher_gaps:
+            candidate_round_teachers = [set() for _ in range(colour_count)]
+            candidate_round_pairs = [set() for _ in range(colour_count)]
+            for session, colour in zip(ordered_sessions, colors):
+                candidate_round_teachers[colour].update(session["pair"])
+                candidate_round_pairs[colour].add(session["pair"])
+            candidate_round_order = _optimise_teacher_round_order(
+                candidate_round_teachers,
+                candidate_round_order,
+                candidate_round_pairs if group_pairs else None,
+            )
+            candidate_gap_score, _ = _round_order_metrics(
+                candidate_round_order,
+                candidate_round_teachers,
+                candidate_round_pairs if group_pairs else None,
+            )
+
+        is_better = colour_count < best_colour_count
+        if avoid_teacher_gaps and colour_count == best_colour_count:
+            is_better = best_gap_score is None or candidate_gap_score < best_gap_score
+        if is_better:
             best_colors = colors
             best_colour_count = colour_count
+            best_gap_score = candidate_gap_score
+            best_round_order = candidate_round_order
         if progress_callback:
             progress_callback(0.1 + 0.8 * (attempt_index + 1) / coloring_attempts)
-        if best_colour_count <= lower_bound:
+        if not avoid_teacher_gaps and best_colour_count <= lower_bound:
             break
 
     # En ombytning af hele runder ændrer ikke lærer-konflikterne. Når
     # lærerpar-optimering er valgt, bruges det derfor som et sekundært mål:
     # runder med de samme lærerpar placeres så vidt muligt ved siden af
     # hinanden, uden at antallet af runder eller paralleliteten ændres.
-    round_order = list(range(best_colour_count))
-    if group_pairs and best_colors is not None and best_colour_count > 1:
+    round_order = best_round_order or list(range(best_colour_count))
+    if not avoid_teacher_gaps and group_pairs and best_colors is not None and best_colour_count > 1:
         pairs_in_round = [set() for _ in range(best_colour_count)]
         for session, colour in zip(ordered_sessions, best_colors):
             pairs_in_round[colour].add(session["pair"])
@@ -1016,6 +1149,10 @@ def make_schedule(
     for session, colour in zip(ordered_sessions, best_colors or []):
         session["round"] = colour_to_round[colour]
     last_round = max(session["round"] for session in ordered_sessions)
+    final_round_teachers = [set() for _ in range(last_round + 1)]
+    for session in ordered_sessions:
+        final_round_teachers[session["round"]].update(session["pair"])
+    teacher_gap_rounds, _ = _round_order_metrics(list(range(last_round + 1)), final_round_teachers)
     actual_pause_count = min(pause_count, last_round)
     pause_after = {
         max(1, min(last_round, round(index * (last_round + 1) / (actual_pause_count + 1))))
@@ -1213,6 +1350,8 @@ def make_schedule(
             "Frokostpause": lunch_mode,
             "Fast frokosttid": _clock_label(lunch_start_dt) if lunch_mode == "Fast tidspunkt for alle lærere" else "Flydende",
             "Lærerpar samlet": "Ja" if group_pairs else "Nej",
+            "Forsøg at undgå lærerhuller": "Ja" if avoid_teacher_gaps else "Nej",
+            "Lærerhuller (runder)": teacher_gap_rounds,
             "Optimeringsdybde": search_attempts,
             "Planlagt tidsforbrug (min.)": total_minutes,
         },
@@ -3397,6 +3536,12 @@ def main_v2() -> None:
                 schedule_pause_minutes = st.number_input("Minutter pr. pause", min_value=0, max_value=120, value=15, step=5, key="v2_schedule_pause_minutes")
             with pause_columns[2]:
                 schedule_group_pairs = st.checkbox("Saml samme lærerpar mest muligt", value=True, key="v2_schedule_group_pairs", help="Elever med samme lærerpar lægges i sammenhængende blokke, så lærerne skifter færre gange.")
+            schedule_avoid_teacher_gaps = st.checkbox(
+                "Forsøg at undgå huller i lærernes vejledningstider",
+                value=False,
+                key="v2_schedule_avoid_teacher_gaps",
+                help="Bevarer det lavest mulige antal vejledningsrunder, men prøver at samle hver lærers runder, så der er færre tomme mellemrum.",
+            )
             lunch_columns = st.columns(3)
             with lunch_columns[0]:
                 schedule_lunch_minutes = st.number_input(
@@ -3431,7 +3576,8 @@ def main_v2() -> None:
                 schedule_solution_source,
                 [schedule_start, schedule_end, int(schedule_student_minutes), int(schedule_pause_count),
                  int(schedule_pause_minutes), int(schedule_transition_minutes), bool(schedule_group_pairs),
-                 schedule_lunch_mode, schedule_lunch_start, int(schedule_lunch_minutes), int(schedule_depth)],
+                 bool(schedule_avoid_teacher_gaps), schedule_lunch_mode, schedule_lunch_start,
+                 int(schedule_lunch_minutes), int(schedule_depth)],
             )
             if st.session_state.get("v2_schedule") is not None and st.session_state.get("v2_schedule_signature") != current_schedule_signature:
                 st.session_state["v2_schedule"] = None
@@ -3456,6 +3602,7 @@ def main_v2() -> None:
                         lunch_start_time=schedule_lunch_start,
                         lunch_minutes=int(schedule_lunch_minutes),
                         search_attempts=int(schedule_depth),
+                        avoid_teacher_gaps=schedule_avoid_teacher_gaps,
                         progress_callback=lambda value: update_algorithm_progress(progress_bar, "Beregner tidsplan", value),
                     )
                     st.session_state["v2_schedule_signature"] = current_schedule_signature
@@ -3482,6 +3629,8 @@ def main_v2() -> None:
                     selected_teacher = st.selectbox("Vis lærer", teacher_options, key="v2_schedule_teacher_filter")
                     teacher_frame = schedule["teachers"] if selected_teacher == "Alle lærere" else schedule["teachers"][schedule["teachers"]["Lærer"] == selected_teacher]
                     st.dataframe(teacher_frame, width="stretch", hide_index=True, height=560)
+                    if settings.get("Forsøg at undgå lærerhuller") == "Ja":
+                        st.caption(f"Huloptimering: {settings.get('Lærerhuller (runder)', 0)} tomme runder mellem lærernes første og sidste vejledning.")
                     st.divider()
                     gantt_options = ["Alle lærere"] + sorted(schedule["teachers"]["Lærer"].unique().tolist(), key=str.casefold)
                     gantt_default = 1 if len(gantt_options) > 1 else 0
