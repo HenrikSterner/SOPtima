@@ -24,6 +24,7 @@ TEST_STUDENTS_FILE = ROOT / "testdata" / "sop_test_elever.csv"
 TEST_TEACHERS_FILE = ROOT / "testdata" / "sop_test_lærere.csv"
 NO_WISHES_LABEL = "Ingen ønsker"
 UNASSIGNED_LABEL = "Ingen vejleder"
+COPYRIGHT = "SOPtima (Copyright Henrik Sterner 2026)"
 
 
 def repair_text(value: Any) -> str:
@@ -970,6 +971,95 @@ def _optimise_teacher_round_order(
     return best_order
 
 
+def _schedule_time(value: Any, *, field_name: str = "tidspunkt") -> dt_time:
+    """Læs et tidspunkt fra tidsplanens indstillinger uden at gætte på formatet."""
+    if isinstance(value, dt_time):
+        return value.replace(second=0, microsecond=0)
+    if isinstance(value, datetime):
+        return value.time().replace(second=0, microsecond=0)
+    text = repair_text(value)
+    try:
+        return datetime.strptime(text, "%H:%M").time()
+    except ValueError as error:
+        raise ValueError(f"{field_name.capitalize()} skal skrives som TT:MM, fx 10:30.") from error
+
+
+def normalise_teacher_blocks(
+    teacher_blocks: dict[str, Any] | None,
+    teachers: list[dict[str, Any]],
+) -> dict[str, list[tuple[dt_time, dt_time]]]:
+    """Validér og saml lærernes eventuelle spærringer pr. dag.
+
+    Værdierne kan være par af ``datetime.time`` eller ``TT:MM``. Overlappende
+    spærringer for samme lærer samles, så tidsplanlægningen kun skal forholde
+    sig til adskilte tidsrum.
+    """
+    known_ids = {normal_key(teacher["id"]) for teacher in teachers}
+    result: dict[str, list[tuple[dt_time, dt_time]]] = {teacher_id: [] for teacher_id in known_ids}
+    for raw_teacher_id, raw_intervals in (teacher_blocks or {}).items():
+        teacher_id = normal_key(raw_teacher_id)
+        if not teacher_id:
+            continue
+        if teacher_id not in known_ids:
+            raise ValueError(f"Spærringen henviser til den ukendte lærer '{repair_text(raw_teacher_id)}'.")
+        if raw_intervals is None:
+            continue
+        if isinstance(raw_intervals, tuple) and len(raw_intervals) == 2 and not isinstance(raw_intervals[0], (tuple, list, dict)):
+            raw_intervals = [raw_intervals]
+        for interval in raw_intervals:
+            if not isinstance(interval, (tuple, list)) or len(interval) != 2:
+                raise ValueError(f"Spærringen for {teacher_id} skal have et start- og sluttidspunkt.")
+            start = _schedule_time(interval[0], field_name="Starttid for spærring")
+            end = _schedule_time(interval[1], field_name="Sluttid for spærring")
+            if start >= end:
+                raise ValueError(f"Spærringen for {teacher_id} skal slutte efter den starter.")
+            result[teacher_id].append((start, end))
+
+    for teacher_id, intervals in result.items():
+        merged: list[tuple[dt_time, dt_time]] = []
+        for start, end in sorted(intervals):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        result[teacher_id] = merged
+    return result
+
+
+def teacher_blocks_from_table(table: pd.DataFrame) -> dict[str, list[tuple[str, str]]]:
+    """Omsæt redigeringstabellen i brugerfladen til spærringer for tidsplanen."""
+    blocks: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for _, row in table.iterrows():
+        teacher_id = normal_key(row.get("Initialer", ""))
+        start = repair_text(row.get("Spærret fra", ""))
+        end = repair_text(row.get("Spærret til", ""))
+        if not start and not end:
+            continue
+        label = repair_text(row.get("Lærer", "")) or teacher_id
+        if not teacher_id:
+            raise ValueError("En lærerspærring mangler initialer.")
+        if not start or not end:
+            raise ValueError(f"Angiv både fra- og til-tid for spærringen hos {label}.")
+        blocks[teacher_id].append((start, end))
+    return dict(blocks)
+
+
+def schedule_time_choices(start_time: dt_time, end_time: dt_time, interval_minutes: int = 5) -> list[dt_time]:
+    """Returnér de klokkeslet, der kan vælges for en lærers spærring."""
+    if start_time >= end_time:
+        return []
+    start = datetime.combine(date.today(), start_time).replace(second=0, microsecond=0)
+    end = datetime.combine(date.today(), end_time).replace(second=0, microsecond=0)
+    choices = [start.time()]
+    current = start
+    while current + timedelta(minutes=interval_minutes) < end:
+        current += timedelta(minutes=interval_minutes)
+        choices.append(current.time())
+    if choices[-1] != end.time():
+        choices.append(end.time())
+    return choices
+
+
 def make_schedule(
     students: list[dict[str, Any]],
     teachers: list[dict[str, Any]],
@@ -987,6 +1077,8 @@ def make_schedule(
     search_attempts: int = 80,
     progress_callback: Any = None,
     avoid_teacher_gaps: bool = False,
+    teacher_blocks: dict[str, Any] | None = None,
+    floating_pauses: bool = False,
 ) -> dict[str, Any]:
     """Lav en parallel vejledningsplan ud fra den aktuelle fordeling."""
     if start_time >= end_time:
@@ -1004,6 +1096,7 @@ def make_schedule(
         progress_callback(0.0)
 
     teacher_map = {teacher["id"]: teacher for teacher in teachers}
+    blocked_intervals = normalise_teacher_blocks(teacher_blocks, teachers)
     sessions = []
     for index, student in enumerate(students):
         assigned = solution["assignments"][index]
@@ -1145,6 +1238,43 @@ def make_schedule(
                         improved = True
         round_order = best_order
 
+    # Rækkefølgen af de farvede runder kan ændres uden at skabe en
+    # dobbeltbooking. Når der er lærerspærringer, vælger vi derfor først de
+    # runder, der faktisk kan begynde nu. Det forhindrer, at en spærring for
+    # én lærer unødigt forsinker helt uafhængige lærerpar.
+    if any(blocked_intervals.values()) and best_colors is not None:
+        teachers_in_colour = [set() for _ in range(best_colour_count)]
+        for session, colour in zip(ordered_sessions, best_colors):
+            teachers_in_colour[colour].update(session["pair"])
+
+        def first_unblocked_start(candidate: datetime, teacher_ids: set[str]) -> datetime:
+            while True:
+                candidate_end = candidate + timedelta(minutes=student_minutes)
+                ends = [
+                    datetime.combine(candidate.date(), blocked_end)
+                    for teacher_id in teacher_ids
+                    for blocked_start, blocked_end in blocked_intervals.get(teacher_id, [])
+                    if candidate < datetime.combine(candidate.date(), blocked_end)
+                    and candidate_end > datetime.combine(candidate.date(), blocked_start)
+                ]
+                if not ends:
+                    return candidate
+                candidate = max(ends)
+
+        ordering_cursor = datetime.combine(date.today(), start_time)
+        remaining_colours = set(round_order)
+        reordered_rounds = []
+        while remaining_colours:
+            candidates = [
+                (first_unblocked_start(ordering_cursor, teachers_in_colour[colour]), round_order.index(colour), colour)
+                for colour in remaining_colours
+            ]
+            chosen_start, _, chosen_colour = min(candidates)
+            reordered_rounds.append(chosen_colour)
+            remaining_colours.remove(chosen_colour)
+            ordering_cursor = chosen_start + timedelta(minutes=student_minutes + transition_minutes)
+        round_order = reordered_rounds
+
     colour_to_round = {colour: round_index for round_index, colour in enumerate(round_order)}
     for session, colour in zip(ordered_sessions, best_colors or []):
         session["round"] = colour_to_round[colour]
@@ -1153,13 +1283,39 @@ def make_schedule(
     for session in ordered_sessions:
         final_round_teachers[session["round"]].update(session["pair"])
     teacher_gap_rounds, _ = _round_order_metrics(list(range(last_round + 1)), final_round_teachers)
+    floating_lunch_round = max(1, (last_round + 1) // 2)
+    if lunch_mode == "Fast tidspunkt for alle lærere":
+        lunch_reference = datetime.combine(date.today(), lunch_start_time)
+        day_reference = datetime.combine(date.today(), start_time)
+        estimated_lunch_round = int((lunch_reference - day_reference).total_seconds() // 60) // max(1, student_minutes + transition_minutes)
+        lunch_pause_round = max(1, min(last_round, estimated_lunch_round))
+    else:
+        lunch_pause_round = floating_lunch_round
     actual_pause_count = min(pause_count, last_round)
-    pause_after = {
-        max(1, min(last_round, round(index * (last_round + 1) / (actual_pause_count + 1))))
-        for index in range(1, actual_pause_count + 1)
-    }
-    while len(pause_after) < actual_pause_count:
-        pause_after.add(next(position for position in range(1, last_round + 1) if position not in pause_after))
+    global_pause_count = actual_pause_count
+
+    def evenly_spaced_positions(first: int, last: int, count: int) -> list[int]:
+        if count <= 0 or first > last:
+            return []
+        candidates = list(range(first, last + 1))
+        positions = [
+            candidates[max(0, min(len(candidates) - 1, round((index + 1) * (len(candidates) + 1) / (count + 1)) - 1))]
+            for index in range(count)
+        ]
+        return list(dict.fromkeys(positions))
+
+    if floating_pauses:
+        # Med to pauser bliver der én i hver side af frokosten. Placeringerne
+        # er altid efter en runde og før en efterfølgende runde.
+        before_count = (global_pause_count + 1) // 2
+        after_count = global_pause_count - before_count
+        pause_after = set(evenly_spaced_positions(1, lunch_pause_round, before_count))
+        pause_after.update(evenly_spaced_positions(lunch_pause_round + 1, last_round, after_count))
+        remaining_positions = [position for position in range(1, last_round + 1) if position not in pause_after]
+        while len(pause_after) < global_pause_count and remaining_positions:
+            pause_after.add(remaining_positions.pop(0))
+    else:
+        pause_after = set(evenly_spaced_positions(1, last_round, global_pause_count))
 
     plan_start = datetime.combine(date.today(), start_time)
     day_end = datetime.combine(date.today(), end_time)
@@ -1172,37 +1328,73 @@ def make_schedule(
     lunch_added = False
     round_starts = []
     timeline_rows = []
+    regular_pause_intervals: list[tuple[datetime, datetime]] = []
     cursor = plan_start
+
+    def next_available_round_start(candidate: datetime, round_teachers: set[str]) -> datetime:
+        """Flyt en runde til efter alle berørte læreres spærringer.
+
+        Runderne bevarer deres indbyrdes rækkefølge. Derfor kan en spærring
+        skabe et hul i den fælles plan, men den kan aldrig føre til, at en
+        lærer bliver booket i sit spærrede tidsrum.
+        """
+        while True:
+            session_end = candidate + timedelta(minutes=student_minutes)
+            overlaps = []
+            for teacher_id in round_teachers:
+                for blocked_start, blocked_end in blocked_intervals.get(teacher_id, []):
+                    start_dt = datetime.combine(candidate.date(), blocked_start)
+                    end_dt = datetime.combine(candidate.date(), blocked_end)
+                    if candidate < end_dt and session_end > start_dt:
+                        overlaps.append(end_dt)
+            if not overlaps:
+                return candidate
+            candidate = max(overlaps)
+
     for round_number in range(last_round + 1):
-        if not lunch_added:
-            if lunch_mode == "Flydende for alle lærere":
-                add_lunch = round_number == floating_lunch_round
-            else:
-                current_round_end = cursor + timedelta(minutes=student_minutes)
-                add_lunch = cursor >= lunch_start_dt or current_round_end > lunch_start_dt
-            if add_lunch:
-                if lunch_mode == "Fast tidspunkt for alle lærere":
-                    if cursor < lunch_start_dt:
-                        cursor = lunch_start_dt
-                    pause_start = lunch_start_dt
-                    pause_end = lunch_end_dt
+        round_teachers = final_round_teachers[round_number]
+        # En fast frokostpause og en individuel spærring kan begge forskyde en
+        # runde. Gentag derfor kontrollen, til tidspunktet er lovligt for dem
+        # begge – også når en spærring netop flytter en runde hen over frokost.
+        while True:
+            if not lunch_added:
+                if lunch_mode == "Flydende for alle lærere":
+                    add_lunch = round_number == floating_lunch_round
                 else:
-                    pause_start = cursor
-                    pause_end = cursor + timedelta(minutes=lunch_minutes)
-                lunch_interval = (pause_start, pause_end)
-                timeline_rows.append({
-                    "_sort": (round_number, -1), "Type": "Frokostpause", "Start": _clock_label(pause_start),
-                    "Slut": _clock_label(pause_end), "Varighed (min.)": lunch_minutes, "Elev": "", "Klasse": "",
-                    "Lærer(e)": "Alle lærere", "Information": "Frokostpause", "Bemærkning": "",
-                })
-                cursor = pause_end
-                lunch_added = True
+                    round_end = cursor + timedelta(minutes=student_minutes)
+                    add_lunch = cursor >= lunch_start_dt or round_end > lunch_start_dt
+                if add_lunch:
+                    if lunch_mode == "Fast tidspunkt for alle lærere":
+                        pause_start, pause_end = lunch_start_dt, lunch_end_dt
+                        cursor = max(cursor, pause_end)
+                    else:
+                        pause_start = cursor
+                        pause_end = cursor + timedelta(minutes=lunch_minutes)
+                        cursor = pause_end
+                    lunch_interval = (pause_start, pause_end)
+                    timeline_rows.append({
+                        "_sort": (round_number, -1), "Type": "Frokostpause", "Start": _clock_label(pause_start),
+                        "Slut": _clock_label(pause_end), "Varighed (min.)": lunch_minutes, "Elev": "", "Klasse": "",
+                        "Lærer(e)": "Alle lærere", "Information": "Frokostpause", "Bemærkning": "",
+                    })
+                    lunch_added = True
+                    continue
+            available_start = next_available_round_start(cursor, round_teachers)
+            if lunch_mode == "Fast tidspunkt for alle lærere" and not lunch_added:
+                # Hvis spærringen flyttede starten frem over frokost, lægges den
+                # faste pause ind, før runden planlægges.
+                if available_start >= lunch_start_dt or available_start + timedelta(minutes=student_minutes) > lunch_start_dt:
+                    cursor = available_start
+                    continue
+            cursor = available_start
+            break
         round_starts.append(cursor)
         round_end = cursor + timedelta(minutes=student_minutes)
         if round_number < last_round:
             next_start = round_end + timedelta(minutes=transition_minutes)
             if round_number + 1 in pause_after:
                 pause_end = next_start + timedelta(minutes=pause_minutes)
+                regular_pause_intervals.append((next_start, pause_end))
                 timeline_rows.append({
                     "_sort": (round_number, 1), "Type": "Pause", "Start": _clock_label(next_start),
                     "Slut": _clock_label(pause_end), "Varighed (min.)": pause_minutes, "Elev": "", "Klasse": "",
@@ -1232,10 +1424,10 @@ def make_schedule(
         rounds = last_round + 1
         guidance_total = rounds * student_minutes
         transition_total = last_round * transition_minutes
-        regular_pause_total = actual_pause_count * pause_minutes
+        regular_pause_total = global_pause_count * pause_minutes
         lunch_total = lunch_minutes if lunch_interval is not None else 0
         accounted_total = guidance_total + transition_total + regular_pause_total + lunch_total
-        fixed_time_adjustment = max(0, required - accounted_total)
+        extra_idle_minutes = max(0, required - accounted_total)
         teacher_loads = Counter(
             teacher_id
             for session in sessions
@@ -1251,20 +1443,46 @@ def make_schedule(
             f"{len(sessions)} elever er fordelt på {rounds} vejledningsrunder, fordi den samme lærer ikke kan vejlede to elever samtidig.",
             f"Selve vejledningerne bruger {rounds} × {student_minutes} minutter = {guidance_total} minutter.",
             f"Skift mellem runder bruger {last_round} × {transition_minutes} minutter = {transition_total} minutter.",
-            f"De almindelige pauser bruger {actual_pause_count} × {pause_minutes} minutter = {regular_pause_total} minutter.",
+            f"De almindelige pauser bruger {global_pause_count} × {pause_minutes} minutter = {regular_pause_total} minutter i den fælles tidsplan.",
             f"Frokostpausen bruger {lunch_total} minutter og er sat til {lunch_mode.casefold()}.",
             f"De mest belastede lærere er {busiest_text}.",
         ]
-        if fixed_time_adjustment:
+        if extra_idle_minutes:
+            if lunch_mode == "Fast tidspunkt for alle lærere":
+                explanation.append(
+                    f"Den faste frokosttid giver desuden {extra_idle_minutes} minutters nødvendig tidsjustering, så ingen vejledning ligger i frokostpausen."
+                )
+            else:
+                active_blocks = [
+                    f"{teacher_label(teacher_id, teacher_map)}: {_clock_label(datetime.combine(date.today(), start))}–{_clock_label(datetime.combine(date.today(), end))}"
+                    for teacher_id, intervals in blocked_intervals.items()
+                    for start, end in intervals
+                ]
+                if active_blocks:
+                    explanation.append(
+                        f"Lærerspærringer giver desuden {extra_idle_minutes} minutters nødvendig ventetid. "
+                        f"Aktive spærringer: {'; '.join(active_blocks[:8])}."
+                    )
+                else:
+                    explanation.append(f"Planens rundeplacering giver desuden {extra_idle_minutes} minutters nødvendig ventetid.")
+        sessions_after_day = [
+            session for session in ordered_sessions
+            if round_starts[session["round"]] + timedelta(minutes=student_minutes) > day_end
+        ]
+        if any(blocked_intervals.values()) and sessions_after_day:
+            affected_students = list(dict.fromkeys(session["student"]["name"] for session in sessions_after_day))
+            preview = ", ".join(affected_students[:8])
+            suffix = " …" if len(affected_students) > 8 else ""
             explanation.append(
-                f"Den faste frokosttid giver desuden {fixed_time_adjustment} minutters nødvendig tidsjustering, så ingen vejledning ligger i frokostpausen."
+                f"{len(sessions_after_day)} vejledning(er) for {len(affected_students)} elev(er) falder efter dagens sluttid på grund af lærerspærringerne. "
+                f"De resterende skal lægges en anden dag, hvis spærringerne og sluttiden fastholdes: {preview}{suffix}."
             )
         raise ValueError(
             f"Tidsplanen kan ikke afsluttes kl. {_clock_label(day_end)}. "
             f"Med de valgte indstillinger skal den mindst afsluttes kl. {minimum_end}; "
             f"tidsrummet fra kl. {_clock_label(plan_start)} til kl. {_clock_label(day_end)} er kun {available} minutter.\n\n"
             + "\n".join(f"• {line}" for line in explanation)
-            + f"\n\nDer mangler derfor {required - available} minutter. Forlæng sluttiden eller reducer elevtid, skiftetid eller almindelige pauser."
+            + f"\n\nDer mangler derfor {required - available} minutter. Forlæng sluttiden, reducér elevtid, skiftetid eller almindelige pauser, eller justér lærerspærringerne."
         )
 
     session_rows = []
@@ -1318,6 +1536,24 @@ def make_schedule(
                 "Initialer": teacher["id"], "Elev": "", "Klasse": "", "Fag": "Frokostpause",
                 "Medvejleder": "—", "Projekttitel": "", "Bemærkning": "Fælles frokostpause",
             })
+    for pause_start, pause_end in regular_pause_intervals:
+        for teacher in teachers:
+            teacher_rows.append({
+                "Type": "Pause", "Start": _clock_label(pause_start), "Slut": _clock_label(pause_end),
+                "Tid": f"{_clock_label(pause_start)}–{_clock_label(pause_end)}", "Lærer": teacher_label(teacher["id"], teacher_map),
+                "Initialer": teacher["id"], "Elev": "", "Klasse": "", "Fag": "Pause", "Medvejleder": "—",
+                "Projekttitel": "", "Bemærkning": "Fælles planlagt pause",
+            })
+    for teacher_id, intervals in blocked_intervals.items():
+        for blocked_start, blocked_end in intervals:
+            teacher_rows.append({
+                "Type": "Spærret", "Start": _clock_label(datetime.combine(date.today(), blocked_start)),
+                "Slut": _clock_label(datetime.combine(date.today(), blocked_end)),
+                "Tid": f"{_clock_label(datetime.combine(date.today(), blocked_start))}–{_clock_label(datetime.combine(date.today(), blocked_end))}",
+                "Lærer": teacher_label(teacher_id, teacher_map), "Initialer": teacher_id,
+                "Elev": "", "Klasse": "", "Fag": "Ikke tilgængelig", "Medvejleder": "—",
+                "Projekttitel": "", "Bemærkning": "Lærerens angivne spærring",
+            })
     timeline_rows.sort(key=lambda row: row["_sort"])
     for row in timeline_rows:
         row.pop("_sort", None)
@@ -1345,11 +1581,13 @@ def make_schedule(
             "Minutter pr. elev": student_minutes,
             "Antal pauser": actual_pause_count,
             "Minutter pr. pause": pause_minutes,
+            "Pauser fordeles om frokost": "Ja" if floating_pauses else "Nej",
             "Minutter mellem elever": transition_minutes,
             "Frokostpause (min.)": lunch_minutes,
             "Frokostpause": lunch_mode,
             "Fast frokosttid": _clock_label(lunch_start_dt) if lunch_mode == "Fast tidspunkt for alle lærere" else "Flydende",
             "Lærerpar samlet": "Ja" if group_pairs else "Nej",
+            "Lærerspærringer": sum(len(intervals) for intervals in blocked_intervals.values()),
             "Forsøg at undgå lærerhuller": "Ja" if avoid_teacher_gaps else "Nej",
             "Lærerhuller (runder)": teacher_gap_rounds,
             "Optimeringsdybde": search_attempts,
@@ -1395,20 +1633,29 @@ def make_teacher_gantt_html(schedule: dict[str, Any], selected_teacher: str | No
         guidance_count = int((teacher_rows["Type"] == "Vejledning").sum()) if "Type" in teacher_rows else len(teacher_rows)
         blocks = []
         for _, row in teacher_rows.iterrows():
+            if str(row.get("Type", "")) == "Pause":
+                continue
             start = clock_minutes(row["Start"])
             end = clock_minutes(row["Slut"])
             is_lunch = str(row.get("Type", "")) == "Frokostpause"
-            subject = "Frokostpause" if is_lunch else str(row.get("Fag", "Vejledning"))
-            student = "Frokostpause" if is_lunch else str(row.get("Elev", "Elev"))
-            color = "#71858a" if is_lunch else palette[sum(ord(char) for char in subject) % len(palette)]
-            tooltip = html.escape(f"{row['Start']}–{row['Slut']} · {student} · {subject}", quote=True)
+            is_blocked = str(row.get("Type", "")) == "Spærret"
+            is_pause = str(row.get("Type", "")) == "Pause"
+            subject = "Frokostpause" if is_lunch else "Pause" if is_pause else "Ikke tilgængelig" if is_blocked else str(row.get("Fag", "Vejledning"))
+            student = "Frokostpause" if is_lunch else "Pause" if is_pause else "Spærret" if is_blocked else str(row.get("Elev", "Elev"))
+            co_teacher = "" if is_lunch or is_pause or is_blocked else str(row.get("Medvejleder", "")).strip(" —")
+            color = "#71858a" if is_lunch else "#a57b28" if is_pause else "#9a5b63" if is_blocked else palette[sum(ord(char) for char in subject) % len(palette)]
+            detail = f" · Medvejleder: {co_teacher}" if co_teacher else ""
+            tooltip = html.escape(f"{row['Start']}–{row['Slut']} · {student} · {subject}{detail}", quote=True)
+            co_teacher_html = f"<small>Medvejleder: {html.escape(co_teacher)}</small>" if co_teacher else ""
             blocks.append(
                 f'<div class="gantt-block" title="{tooltip}" style="left:{position(start):.3f}%;width:{max(0.8, position(end) - position(start)):.3f}%;background:{color}">'
                 f'<span>{html.escape(row["Start"])}–{html.escape(row["Slut"])}</span>'
-                f'<strong>{html.escape(student)}</strong><small>{html.escape(subject)}</small></div>'
+                f'<strong>{html.escape(student)}</strong><small>{html.escape(subject)}</small>{co_teacher_html}</div>'
             )
+        teacher_initials = " ".join(teacher_rows["Initialer"].dropna().astype(str).unique().tolist())
+        search_terms = normal_key(f"{name} {teacher_initials}")
         rows.append(
-            f'<div class="gantt-row"><div class="gantt-name">{html.escape(name)}<small>{guidance_count} elev(er)</small></div>'
+            f'<div class="gantt-row" data-teacher="{html.escape(search_terms, quote=True)}"><button type="button" class="gantt-name teacher-link" data-teacher-select="{html.escape(search_terms, quote=True)}">{html.escape(name)}<small>{guidance_count} elev(er)</small></button>'
             f'<div class="gantt-track">{"".join(blocks)}</div></div>'
         )
 
@@ -1421,12 +1668,12 @@ def make_teacher_gantt_html(schedule: dict[str, Any], selected_teacher: str | No
 .gantt-intro strong{{display:block;color:#172126;font:700 21px Georgia,serif;margin-bottom:3px}}
 .gantt-scale{{margin-left:178px;height:28px;min-width:760px;position:relative;border-bottom:1px solid #dce4e2}}
 .gantt-tick{{position:absolute;bottom:5px;transform:translateX(-50%);font-size:11px;color:#66777f;white-space:nowrap}}
-.gantt-row{{display:flex;min-width:938px;min-height:72px;border-bottom:1px solid #edf1f0}}
+.gantt-row{{display:flex;min-width:938px;min-height:82px;border-bottom:1px solid #edf1f0}}
 .gantt-row:last-child{{border-bottom:0}}
 .gantt-name{{width:162px;flex:0 0 162px;padding:15px 12px 8px 0;font-weight:700;color:#172126;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
 .gantt-name small{{display:block;color:#66777f;font-size:11px;font-weight:400;margin-top:3px}}
-.gantt-track{{position:relative;flex:1;margin:9px 0;background:repeating-linear-gradient(to right,#f4f8f7 0,#f4f8f7 calc(8.333% - 1px),#dfe9e6 calc(8.333% - 1px),#dfe9e6 8.333%);border-radius:8px;min-height:54px}}
-.gantt-block{{position:absolute;top:5px;height:44px;border-radius:7px;padding:4px 7px;box-sizing:border-box;color:white;overflow:hidden;box-shadow:0 2px 5px #1721262b;line-height:1.15;font-size:10px;min-width:25px}}
+.gantt-track{{position:relative;flex:1;margin:9px 0;background:repeating-linear-gradient(to right,#f4f8f7 0,#f4f8f7 calc(8.333% - 1px),#dfe9e6 calc(8.333% - 1px),#dfe9e6 8.333%);border-radius:8px;min-height:64px}}
+.gantt-block{{position:absolute;top:5px;height:54px;border-radius:7px;padding:4px 7px;box-sizing:border-box;color:white;overflow:hidden;box-shadow:0 2px 5px #1721262b;line-height:1.15;font-size:10px;min-width:25px}}
 .gantt-block span,.gantt-block strong,.gantt-block small{{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
 .gantt-block strong{{font-size:11px;margin-top:2px}}
 .gantt-block small{{opacity:.88;margin-top:2px}}
@@ -1437,11 +1684,40 @@ def make_teacher_gantt_html(schedule: dict[str, Any], selected_teacher: str | No
 </div>'''
 
 
+def excel_sheet_name(value: Any, used_names: set[str]) -> str:
+    """Lav et kort, gyldigt og unikt Excel-fanenavn."""
+    base = repair_text(value)
+    for invalid_character in ("[", "]", ":", "*", "?", "/", "\\"):
+        base = base.replace(invalid_character, " ")
+    base = " ".join(base.split()).strip(" '") or "Lærer"
+    base = base[:31]
+    candidate = base
+    suffix_number = 2
+    while candidate.casefold() in used_names:
+        suffix = f" ({suffix_number})"
+        candidate = base[: 31 - len(suffix)].rstrip() + suffix
+        suffix_number += 1
+    used_names.add(candidate.casefold())
+    return candidate
+
+
 def make_schedule_excel(schedule: dict[str, Any]) -> bytes:
+    teacher_plan = schedule["teachers"].copy()
+    if not teacher_plan.empty:
+        teacher_plan["_sort_teacher"] = teacher_plan["Lærer"].map(normal_key)
+        teacher_plan = teacher_plan.sort_values(["_sort_teacher", "Start", "Slut"], kind="stable").drop(columns="_sort_teacher")
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         safe_excel_frame(schedule["students"]).to_excel(writer, index=False, sheet_name="Elevplan")
-        safe_excel_frame(schedule["teachers"]).to_excel(writer, index=False, sheet_name="Lærerplan")
+        safe_excel_frame(teacher_plan).to_excel(writer, index=False, sheet_name="Lærerplan")
+        used_sheet_names = {"elevplan", "lærerplan", "tidslinje", "lærerpar", "indstillinger"}
+        for teacher_name in sorted(teacher_plan["Lærer"].dropna().unique().tolist(), key=normal_key):
+            personal_plan = teacher_plan[teacher_plan["Lærer"] == teacher_name].sort_values(["Start", "Slut"], kind="stable")
+            safe_excel_frame(personal_plan).to_excel(
+                writer,
+                index=False,
+                sheet_name=excel_sheet_name(teacher_name, used_sheet_names),
+            )
         safe_excel_frame(schedule["timeline"]).to_excel(writer, index=False, sheet_name="Tidslinje")
         safe_excel_frame(schedule["pairs"]).to_excel(writer, index=False, sheet_name="Lærerpar")
         safe_excel_frame(pd.DataFrame([schedule["settings"]])).to_excel(writer, index=False, sheet_name="Indstillinger")
@@ -1457,6 +1733,15 @@ def make_schedule_html(schedule: dict[str, Any]) -> str:
     settings = schedule["settings"]
     setting_lines = "".join(f"<li><strong>{html.escape(str(key))}:</strong> {html.escape(str(value))}</li>" for key, value in settings.items())
     gantt_html = make_teacher_gantt_html(schedule, "Alle lærere")
+    teacher_frame = schedule["teachers"].sort_values(["Lærer", "Start", "Slut"], kind="stable")
+    teacher_frame = teacher_frame[teacher_frame["Type"] == "Vejledning"]
+    teacher_columns = ["Tid", "Elev", "Klasse", "Fag", "Medvejleder", "Projekttitel", "Bemærkning"]
+    teacher_headers = "".join(f"<th>{html.escape(str(column))}</th>" for column in teacher_columns)
+    teacher_agenda_rows = []
+    for row in teacher_frame.fillna("").to_dict("records"):
+        search_terms = normal_key(f"{row.get('Lærer', '')} {row.get('Initialer', '')}")
+        cells = "".join(f"<td>{html.escape(str(row.get(column, '')))}</td>" for column in teacher_columns)
+        teacher_agenda_rows.append(f'<tr data-teacher="{html.escape(search_terms, quote=True)}">{cells}</tr>')
     return f"""<!doctype html>
 <html lang="da">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1469,16 +1754,85 @@ h1,h2{{font-family:Georgia,serif}} h1{{font-size:38px;margin:0 0 8px}} h2{{margi
 .intro p{{margin:4px 0;color:#66777f}} ul{{display:flex;flex-wrap:wrap;gap:8px 28px;padding-left:20px}}
 .table-wrap{{overflow:auto;background:white;border:1px solid #dce4e2;border-radius:12px}}
 table{{border-collapse:collapse;width:100%;min-width:760px}} th,td{{padding:9px 11px;border-bottom:1px solid #e2e9e7;text-align:left;vertical-align:top}} th{{background:#e7f4f1;color:#075f5b;white-space:nowrap}} tr:last-child td{{border-bottom:0}}
+.teacher-search{{box-sizing:border-box;width:min(520px,100%);padding:11px 13px;border:1px solid #9bb5b1;border-radius:8px;font:inherit;margin:0 0 16px}} .teacher-agenda{{margin-top:22px}} .teacher-agenda h3{{font-family:Georgia,serif;margin:0 0 9px}} #teacher-empty{{color:#66777f}}
+.teacher-link{{border:0;background:transparent;text-align:left;cursor:pointer;font:inherit}}
+.copyright{{margin:36px 0 0;text-align:center;color:#66777f;font-size:12px}}
 @media print{{body{{background:white}} main{{padding:0}} .card,.table-wrap{{box-shadow:none}} h2{{break-before:page}}}}
 </style></head>
 <body><main>
-<section class="intro"><h1>Vejledningsplan</h1><p>Detaljeret tidsplan for elever og lærere baseret på den beregnede SOP-fordeling.</p><ul>{setting_lines}</ul></section>
-<section class="card"><h2>Visuel lærerplan</h2>{gantt_html}</section>
-<section class="card"><h2>Elevplan</h2><div class="table-wrap">{schedule["students"].to_html(index=False, escape=True, border=0)}</div></section>
-<section class="card"><h2>Lærerplan</h2><div class="table-wrap">{schedule["teachers"].to_html(index=False, escape=True, border=0)}</div></section>
-<section class="card"><h2>Samlet tidslinje</h2><div class="table-wrap">{schedule["timeline"].to_html(index=False, escape=True, border=0)}</div></section>
-<section class="card"><h2>Lærerpar</h2><div class="table-wrap">{schedule["pairs"].to_html(index=False, escape=True, border=0)}</div></section>
-</main></body></html>"""
+<section class="intro"><h1>Vejledningsplan</h1><p>Detaljeret tidsplan for elever og lærere baseret på den beregnede SOP-fordeling. Fordelingen er foretaget ud fra SOPtima – en algoritme udviklet af Henrik (hst@nextkhb.dk). Stadig i beta, så skriv gerne, hvis der er mangler eller fejl.</p><ul>{setting_lines}</ul></section>
+<section class="card"><h2>Vejledningsplan for lærere</h2><label for="teacher-query">Søg på lærerens navn eller initialer</label><input class="teacher-search" id="teacher-query" type="search" autocomplete="off" placeholder="Fx Anne eller AB"><p id="teacher-prompt">Skriv lærerens navn eller initialer for at se den specifikke plan.</p>{gantt_html}
+<section class="teacher-agenda" id="teacher-agenda" hidden><h3>Elever med vejledning hos den valgte lærer</h3><div class="table-wrap"><table><thead><tr>{teacher_headers}</tr></thead><tbody id="teacher-agenda-rows">{''.join(teacher_agenda_rows)}</tbody></table></div><p id="teacher-empty" hidden>Ingen lærer matcher søgningen.</p></section></section>
+<div id="student-data" hidden aria-hidden="true">{schedule["students"].to_html(index=False, escape=True, border=0)}</div>
+<footer class="copyright">{html.escape(COPYRIGHT)}</footer>
+<script>
+const teacherQuery=document.getElementById('teacher-query');
+const ganttRows=[...document.querySelectorAll('.gantt-row')], agendaRows=[...document.querySelectorAll('#teacher-agenda-rows tr')], teacherAgenda=document.getElementById('teacher-agenda'), teacherEmpty=document.getElementById('teacher-empty');
+const teacherPrompt=document.getElementById('teacher-prompt');
+function normaliseTeacher(value){{return String(value||'').toLocaleLowerCase('da-DK').trim().replace(/\\s+/g,' ');}}
+function filterTeachers(){{const term=normaliseTeacher(teacherQuery.value);let matches=0;ganttRows.forEach(row=>{{const visible=!term||row.dataset.teacher.includes(term);row.hidden=!visible;row.style.display=visible?'':'none';}});agendaRows.forEach(row=>{{const visible=Boolean(term)&&row.dataset.teacher.includes(term);row.hidden=!visible;row.style.display=visible?'':'none';if(visible)matches++;}});teacherAgenda.hidden=!term;teacherEmpty.hidden=matches!==0;teacherPrompt.hidden=Boolean(term);}}
+teacherQuery.addEventListener('input',filterTeachers);
+teacherQuery.addEventListener('change',filterTeachers);
+document.querySelectorAll('.teacher-link').forEach(link=>link.addEventListener('click',()=>{{teacherQuery.value=link.dataset.teacherSelect||'';filterTeachers();teacherQuery.focus();}}));
+filterTeachers();
+</script></main></body></html>"""
+
+
+def compact_search_key(value: Any) -> str:
+    """Søgenøgle uden tegn, punktummer eller mellemrum (fx 3.q == 3q)."""
+    text = normal_key(value)
+    text = "".join(char for char in unicodedata.normalize("NFD", text) if unicodedata.category(char) != "Mn")
+    return "".join(char for char in text if char.isalnum())
+
+
+def class_search_keys(value: Any) -> list[str]:
+    """Returnér klassens egen nøgle og elevvenlige aliaser (fx 3q/S 2024q)."""
+    key = compact_search_key(value)
+    keys = [key] if key else []
+    match = re.fullmatch(r"s(20\d{2})([a-z])", key)
+    if match:
+        # S 2024q er 3q i skoleåret 2026; beregn klassetrinnet ud fra
+        # startåret, så samme logik også virker for senere årgange.
+        grade = max(1, date.today().year - int(match.group(1)) + 1)
+        keys.append(f"{grade}{match.group(2)}")
+    return list(dict.fromkeys(keys))
+
+
+def make_student_schedule_html(schedule: dict[str, Any]) -> str:
+    """Lav en selvstændig elevside, der kan søges lokalt uden login eller server."""
+    columns = ["Tid", "Elev", "Klasse", "Fag 1", "Vejleder 1", "Fag 2", "Vejleder 2"]
+    frame = schedule["students"].reindex(columns=columns, fill_value="").fillna("")
+    headers = "".join(f"<th>{html.escape(column)}</th>" for column in columns)
+    rows = []
+    for row in frame.to_dict("records"):
+        searchable = f"{compact_search_key(row['Elev'])} {' '.join(class_search_keys(row['Klasse']))}"
+        cells = "".join(f"<td>{html.escape(str(row[column]))}</td>" for column in columns)
+        rows.append(f'<tr data-search="{html.escape(searchable, quote=True)}">{cells}</tr>')
+    return f"""<!doctype html>
+<html lang="da">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Min SOP-vejledning</title>
+<style>
+body{{margin:0;background:#f7fbf9;color:#172126;font:16px/1.45 Arial,sans-serif}}
+main{{max-width:1080px;margin:auto;padding:48px 20px 70px}}
+h1{{font:700 38px Georgia,serif;margin:0 0 8px}} p{{color:#52656a;margin:0 0 24px}}
+.card{{background:#fff;border:1px solid #dce4e2;border-radius:14px;padding:20px;box-shadow:0 8px 24px #1933300b}}
+label{{display:block;font-weight:700;margin-bottom:7px}} input{{box-sizing:border-box;width:100%;padding:12px 14px;border:1px solid #9bb5b1;border-radius:8px;font:inherit}}
+.hint{{font-size:13px;margin:8px 0 18px}} .table-wrap{{overflow:auto}} table{{border-collapse:collapse;width:100%;min-width:780px}}
+th,td{{padding:10px 11px;border-bottom:1px solid #e2e9e7;text-align:left;vertical-align:top}} th{{background:#e7f4f1;color:#075f5b;white-space:nowrap}}
+#empty{{display:none;margin:18px 0 0;color:#52656a}} @media print{{main{{padding:0}}.card{{border:0;box-shadow:none}}}}
+.copyright{{margin:34px 0 0;text-align:center;color:#66777f;font-size:12px}}
+</style></head>
+<body><main><h1>Find din SOP-vejledning</h1><p>Detaljeret tidsplan for elever baseret på den beregnede SOP-fordeling. Fordelingen er foretaget ud fra SOPtima – en algoritme udviklet af Henrik (hst@nextkhb.dk). Stadig i beta, så skriv gerne, hvis der er mangler eller fejl.</p>
+<section class="card"><label for="query">Elevnavn eller klasse</label><input id="query" type="search" autocomplete="off" placeholder="Fx Ane Andersen, 3q eller 3.q">
+<p class="hint">Søgningen foregår kun i denne fil.</p><div class="table-wrap"><table><thead><tr>{headers}</tr></thead><tbody id="results">{''.join(rows)}</tbody></table></div><p id="empty">Ingen vejledninger matcher søgningen.</p></section>
+<footer class="copyright">{html.escape(COPYRIGHT)}</footer>
+<script>
+const query=document.getElementById('query'), rows=[...document.querySelectorAll('#results tr')], empty=document.getElementById('empty');
+function normalise(value){{return String(value||'').toLocaleLowerCase('da-DK').normalize('NFD').replace(/[\\u0300-\\u036f]/g,'').replace(/[^a-z0-9]+/g,'');}}
+function filter(){{const term=normalise(query.value);let shown=0;rows.forEach(row=>{{const match=!term||row.dataset.search.includes(term);row.hidden=!match;if(match)shown++;}});empty.style.display=shown?'none':'block';}}
+query.addEventListener('input',filter); query.focus();
+</script></main></body></html>"""
 
 
 def replace_docx_placeholders(template: bytes, values: dict[str, str]) -> bytes:
@@ -3519,29 +3873,97 @@ def main_v2() -> None:
                 st.error(f"{missing_schedule_assignments} elev(er) mangler en komplet vejlederfordeling. Ret dem i trin 5, før tidsplanen genereres.")
 
         if uploaded_schedule is not None or solution is not None:
+            # Opdatér eksisterende sessioner én gang til de aftalte
+            # standardindstillinger; derefter er alle felter fortsat frie at
+            # justere som normalt.
+            if st.session_state.get("v2_schedule_defaults_version") != "2026-09-15":
+                st.session_state.update({
+                    "v2_schedule_start": dt_time(8, 15),
+                    "v2_schedule_end": dt_time(16, 15),
+                    "v2_schedule_transition_minutes": 0,
+                    "v2_schedule_pause_count": 2,
+                    "v2_schedule_pause_minutes": 10,
+                    "v2_schedule_floating_pauses": True,
+                    "v2_schedule_group_pairs": True,
+                    "v2_schedule_avoid_teacher_gaps": True,
+                    "v2_schedule_defaults_version": "2026-09-15",
+                })
             st.subheader("2 · Indstil dagen")
             time_columns = st.columns(4)
             with time_columns[0]:
-                schedule_start = st.time_input("Starttidspunkt", value=dt_time(9, 0), key="v2_schedule_start")
+                schedule_start = st.time_input("Starttidspunkt", value=dt_time(8, 15), key="v2_schedule_start")
             with time_columns[1]:
-                schedule_end = st.time_input("Sluttidspunkt", value=dt_time(15, 0), key="v2_schedule_end")
+                schedule_end = st.time_input("Sluttidspunkt", value=dt_time(16, 15), key="v2_schedule_end")
             with time_columns[2]:
                 schedule_student_minutes = st.number_input("Minutter pr. elev", min_value=1, max_value=180, value=20, step=5, key="v2_schedule_student_minutes")
             with time_columns[3]:
-                schedule_transition_minutes = st.number_input("Minutter mellem elever", min_value=0, max_value=60, value=5, step=1, key="v2_schedule_transition_minutes")
+                schedule_transition_minutes = st.number_input("Minutter mellem elever", min_value=0, max_value=60, value=0, step=1, key="v2_schedule_transition_minutes")
             pause_columns = st.columns(3)
             with pause_columns[0]:
                 schedule_pause_count = st.number_input("Antal pauser", min_value=0, max_value=20, value=2, step=1, key="v2_schedule_pause_count")
             with pause_columns[1]:
-                schedule_pause_minutes = st.number_input("Minutter pr. pause", min_value=0, max_value=120, value=15, step=5, key="v2_schedule_pause_minutes")
+                schedule_pause_minutes = st.number_input("Minutter pr. pause", min_value=0, max_value=120, value=10, step=5, key="v2_schedule_pause_minutes")
             with pause_columns[2]:
                 schedule_group_pairs = st.checkbox("Saml samme lærerpar mest muligt", value=True, key="v2_schedule_group_pairs", help="Elever med samme lærerpar lægges i sammenhængende blokke, så lærerne skifter færre gange.")
+            schedule_floating_pauses = st.checkbox(
+                "Fordel pauser før og efter frokost",
+                value=True,
+                key="v2_schedule_floating_pauses",
+                help="Med to pauser placeres én efter en vejledning før frokost og én efter frokost, men før dagens sidste vejledning.",
+            )
             schedule_avoid_teacher_gaps = st.checkbox(
                 "Forsøg at undgå huller i lærernes vejledningstider",
-                value=False,
+                value=True,
                 key="v2_schedule_avoid_teacher_gaps",
                 help="Bevarer det lavest mulige antal vejledningsrunder, men prøver at samle hver lærers runder, så der er færre tomme mellemrum.",
             )
+            st.markdown("#### Lærernes spærringer")
+            st.caption("Vælg de lærere, der har en spærring, og vælg derefter fra- og til-klokkeslet. Tiderne kan kun vælges fra listen og ligger inden for den valgte dag.")
+            teacher_block_seed = stable_signature([teacher["id"] for teacher in schedule_teachers_source])
+            if st.session_state.get("v2_schedule_teacher_block_seed") != teacher_block_seed:
+                st.session_state["v2_schedule_teacher_block_seed"] = teacher_block_seed
+                st.session_state.pop("v2_schedule_blocked_teachers", None)
+            teacher_map_for_blocks = {teacher["id"]: teacher for teacher in schedule_teachers_source}
+            teacher_ids_for_blocks = sorted(teacher_map_for_blocks, key=lambda teacher_id: teacher_label(teacher_id, teacher_map_for_blocks).casefold())
+            blocked_teacher_ids = st.multiselect(
+                "Lærere med spærring",
+                teacher_ids_for_blocks,
+                format_func=lambda teacher_id: teacher_label(teacher_id, teacher_map_for_blocks),
+                placeholder="Vælg eventuelt en eller flere lærere",
+                key="v2_schedule_blocked_teachers",
+            )
+            teacher_blocks: dict[str, list[tuple[dt_time, dt_time]]] = {}
+            teacher_blocks_error = ""
+            time_choices = schedule_time_choices(schedule_start, schedule_end)
+            if not time_choices:
+                teacher_blocks_error = "Sluttidspunktet skal ligge efter starttidspunktet."
+                st.error(teacher_blocks_error)
+            elif blocked_teacher_ids:
+                for teacher_id in blocked_teacher_ids:
+                    label = teacher_label(teacher_id, teacher_map_for_blocks)
+                    with st.container(border=True):
+                        st.markdown(f"**{label}**")
+                        block_columns = st.columns(2)
+                        with block_columns[0]:
+                            blocked_start = st.selectbox(
+                                "Spærret fra",
+                                time_choices[:-1],
+                                format_func=lambda value: value.strftime("%H:%M"),
+                                key=f"v2_schedule_block_start_{teacher_id}",
+                            )
+                        valid_end_choices = [value for value in time_choices if value > blocked_start]
+                        end_key = f"v2_schedule_block_end_{teacher_id}"
+                        if end_key in st.session_state and st.session_state[end_key] not in valid_end_choices:
+                            st.session_state[end_key] = valid_end_choices[0]
+                        with block_columns[1]:
+                            blocked_end = st.selectbox(
+                                "Spærret til",
+                                valid_end_choices,
+                                format_func=lambda value: value.strftime("%H:%M"),
+                                key=end_key,
+                            )
+                    teacher_blocks[teacher_id] = [(blocked_start, blocked_end)]
+                st.info(f"{len(teacher_blocks)} lærerspærring(er) er aktiv(e) og vil påvirke tidsplanen.")
             lunch_columns = st.columns(3)
             with lunch_columns[0]:
                 schedule_lunch_minutes = st.number_input(
@@ -3576,15 +3998,15 @@ def main_v2() -> None:
                 schedule_solution_source,
                 [schedule_start, schedule_end, int(schedule_student_minutes), int(schedule_pause_count),
                  int(schedule_pause_minutes), int(schedule_transition_minutes), bool(schedule_group_pairs),
-                 bool(schedule_avoid_teacher_gaps), schedule_lunch_mode, schedule_lunch_start,
-                 int(schedule_lunch_minutes), int(schedule_depth)],
+                 bool(schedule_floating_pauses), bool(schedule_avoid_teacher_gaps), schedule_lunch_mode, schedule_lunch_start,
+                 int(schedule_lunch_minutes), int(schedule_depth), teacher_blocks],
             )
             if st.session_state.get("v2_schedule") is not None and st.session_state.get("v2_schedule_signature") != current_schedule_signature:
                 st.session_state["v2_schedule"] = None
                 st.session_state["v2_schedule_signature"] = None
                 st.info("Tidsindstillingerne eller datakilden er ændret. Generér planen igen for at se et aktuelt resultat.")
             st.subheader("3 · Generér og kontrollér")
-            if st.button("Generér tidsplan" if uploaded_schedule is not None else "Lav eller opdater tidsplan", type="primary", key="v2_make_schedule", disabled=not schedule_source_ready):
+            if st.button("Generér tidsplan" if uploaded_schedule is not None else "Lav eller opdater tidsplan", type="primary", key="v2_make_schedule", disabled=not schedule_source_ready or bool(teacher_blocks_error)):
                 try:
                     progress_bar = st.progress(0.0, text="Beregner tidsplan: 0 %")
                     st.session_state["v2_schedule"] = make_schedule(
@@ -3603,6 +4025,8 @@ def main_v2() -> None:
                         lunch_minutes=int(schedule_lunch_minutes),
                         search_attempts=int(schedule_depth),
                         avoid_teacher_gaps=schedule_avoid_teacher_gaps,
+                        teacher_blocks=teacher_blocks,
+                        floating_pauses=schedule_floating_pauses,
                         progress_callback=lambda value: update_algorithm_progress(progress_bar, "Beregner tidsplan", value),
                     )
                     st.session_state["v2_schedule_signature"] = current_schedule_signature
@@ -3625,32 +4049,44 @@ def main_v2() -> None:
                 with schedule_students:
                     st.dataframe(schedule["students"], width="stretch", hide_index=True, height=560)
                 with schedule_teachers:
-                    teacher_options = ["Alle lærere"] + sorted(schedule["teachers"]["Lærer"].unique().tolist(), key=str.casefold)
-                    selected_teacher = st.selectbox("Vis lærer", teacher_options, key="v2_schedule_teacher_filter")
-                    teacher_frame = schedule["teachers"] if selected_teacher == "Alle lærere" else schedule["teachers"][schedule["teachers"]["Lærer"] == selected_teacher]
+                    teacher_query = st.text_input("Søg på lærerens navn", placeholder="Skriv navn eller initialer", key="v2_schedule_teacher_search")
+                    all_teacher_names = sorted(schedule["teachers"]["Lærer"].dropna().unique().tolist(), key=str.casefold)
+                    query_key = normal_key(teacher_query)
+                    matching_teacher_names = [
+                        name for name in all_teacher_names
+                        if not query_key or query_key in normal_key(name)
+                    ]
+                    teacher_frame = schedule["teachers"][schedule["teachers"]["Lærer"].isin(matching_teacher_names)]
                     st.dataframe(teacher_frame, width="stretch", hide_index=True, height=560)
                     if settings.get("Forsøg at undgå lærerhuller") == "Ja":
                         st.caption(f"Huloptimering: {settings.get('Lærerhuller (runder)', 0)} tomme runder mellem lærernes første og sidste vejledning.")
                     st.divider()
-                    gantt_options = ["Alle lærere"] + sorted(schedule["teachers"]["Lærer"].unique().tolist(), key=str.casefold)
-                    gantt_default = 1 if len(gantt_options) > 1 else 0
-                    gantt_teacher = st.selectbox("Vis visuel dagsplan for", gantt_options, index=gantt_default, key="v2_schedule_gantt_teacher")
-                    st.markdown(make_teacher_gantt_html(schedule, gantt_teacher), unsafe_allow_html=True)
+                    visual_schedule = {**schedule, "teachers": teacher_frame}
+                    st.markdown(make_teacher_gantt_html(visual_schedule, None), unsafe_allow_html=True)
                 with schedule_timeline:
                     st.dataframe(schedule["timeline"], width="stretch", hide_index=True, height=560)
                 with schedule_pairs:
                     st.dataframe(schedule["pairs"], width="stretch", hide_index=True)
-                download_columns = st.columns(2)
+                download_columns = st.columns(3)
                 with download_columns[0]:
                     st.download_button(
                         "Download tidsplan som HTML",
                         data=make_schedule_html(schedule).encode("utf-8"),
-                        file_name="vejledningsplan.html",
+                        file_name="Vejledningsplan (SOPtima beta af Henrik Sterner).html",
                         mime="text/html",
                         type="primary",
                         key="v2_download_schedule_html",
                     )
                 with download_columns[1]:
+                    st.download_button(
+                        "Download elevopslag som HTML",
+                        data=make_student_schedule_html(schedule).encode("utf-8"),
+                        file_name="elevopslag-vejledning.html",
+                        mime="text/html",
+                        type="primary",
+                        key="v2_download_student_schedule_html",
+                    )
+                with download_columns[2]:
                     schedule_export = try_excel_export(lambda: make_schedule_excel(schedule))
                     if schedule_export is not None:
                         st.download_button(
@@ -3687,6 +4123,7 @@ def main_v2() -> None:
                 on_click=navigate_to_step,
                 args=(process_steps[active_index + 1],),
             )
+    st.caption(COPYRIGHT)
 
 
 if __name__ == "__main__":

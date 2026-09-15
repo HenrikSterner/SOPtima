@@ -68,7 +68,13 @@ def optimise(students, teachers, capacities, **overrides):
     return app.optimize(students, teachers, capacities, **settings)
 
 
-def schedule_for_pairs(pairs: list[tuple[str, str]], *, group_pairs: bool = False, attempts: int = 20):
+def schedule_for_pairs(
+    pairs: list[tuple[str, str]],
+    *,
+    group_pairs: bool = False,
+    attempts: int = 20,
+    avoid_teacher_gaps: bool = False,
+):
     ids = sorted({teacher_id for pair in pairs for teacher_id in pair})
     teachers = [teacher(teacher_id, (f"Fag {teacher_id}",)) for teacher_id in ids]
     students = [
@@ -94,6 +100,7 @@ def schedule_for_pairs(pairs: list[tuple[str, str]], *, group_pairs: bool = Fals
         lunch_mode="Flydende for alle lærere",
         lunch_minutes=30,
         search_attempts=attempts,
+        avoid_teacher_gaps=avoid_teacher_gaps,
     )
 
 
@@ -379,6 +386,18 @@ def test_grouping_pairs_preserves_conflict_rules_and_round_count():
         assert not rows.duplicated(subset=["Start", "Slut"]).any()
 
 
+def test_teacher_gap_optimisation_collects_rounds_without_changing_round_count():
+    pairs = [("d", "h"), ("c", "f"), ("e", "i"), ("d", "g"), ("b", "e"), ("d", "g"), ("d", "f")]
+    regular = schedule_for_pairs(pairs, attempts=30)
+    optimised = schedule_for_pairs(pairs, attempts=30, avoid_teacher_gaps=True)
+
+    assert optimised["settings"]["Lærerhuller (runder)"] < regular["settings"]["Lærerhuller (runder)"]
+    assert guidance_round_count(optimised) == guidance_round_count(regular)
+    guidance = optimised["teachers"][optimised["teachers"]["Type"] == "Vejledning"]
+    for _, rows in guidance.groupby("Initialer"):
+        assert not rows.duplicated(subset=["Start", "Slut"]).any()
+
+
 def test_schedule_validates_missing_assignments_and_times():
     students = [student()]
     teachers = [teacher("ab", ("Dansk",)), teacher("cd", ("Historie",))]
@@ -398,11 +417,101 @@ def test_schedule_reports_required_time_and_fixed_lunch_bounds():
         app.make_schedule(students, teachers, solution, clock(9), clock(9, 30), 20, 0, 0, 0, False, lunch_mode="Flydende for alle lærere", lunch_minutes=30)
 
 
+def test_schedule_respects_individual_teacher_block_and_shows_it():
+    students = [student()]
+    teachers = [teacher("ab", ("Dansk",)), teacher("cd", ("Historie",))]
+    schedule = app.make_schedule(
+        students, teachers, {"assignments": [["ab", "cd"]]}, clock(8), clock(16), 20, 0, 0, 0, False,
+        lunch_mode="Flydende for alle lærere", lunch_minutes=30,
+        teacher_blocks={"ab": [(clock(8), clock(9))]},
+    )
+    assert schedule["students"].iloc[0]["Start"] == "09:00"
+    blocked = schedule["teachers"][schedule["teachers"]["Type"] == "Spærret"]
+    assert blocked[["Initialer", "Start", "Slut"]].values.tolist() == [["ab", "08:00", "09:00"]]
+    assert schedule["settings"]["Lærerspærringer"] == 1
+
+
+def test_teacher_blocks_merge_and_validate_incomplete_editor_rows():
+    teachers = [teacher("ab", ("Dansk",))]
+    blocks = app.normalise_teacher_blocks({"AB": [("08:00", "09:00"), ("08:30", "10:00")]}, teachers)
+    assert blocks["ab"] == [(clock(8), clock(10))]
+    frame = pd.DataFrame([{"Lærer": "AB", "Initialer": "ab", "Spærret fra": "08:00", "Spærret til": ""}])
+    with pytest.raises(ValueError, match="både fra- og til-tid"):
+        app.teacher_blocks_from_table(frame)
+
+
+def test_teacher_block_time_choices_follow_the_selected_day():
+    choices = app.schedule_time_choices(clock(8, 15), clock(8, 30))
+    assert choices == [clock(8, 15), clock(8, 20), clock(8, 25), clock(8, 30)]
+    assert app.schedule_time_choices(clock(16), clock(8)) == []
+
+
+def test_teacher_blocks_explain_delay_in_floating_lunch_mode():
+    students = [
+        student(name="A", subjects=("Dansk", "Historie"), student_id="E001"),
+        student(name="B", subjects=("Fysik", "Kemi"), student_id="E002"),
+    ]
+    teachers = [
+        teacher("ab", ("Dansk",)), teacher("cd", ("Historie",)),
+        teacher("ef", ("Fysik",)), teacher("gh", ("Kemi",)),
+    ]
+    solution = {"assignments": [["ab", "cd"], ["ef", "gh"]]}
+    schedule = app.make_schedule(
+        students, teachers, solution, clock(8), clock(12), 20, 0, 0, 0, False,
+        lunch_mode="Flydende for alle lærere", lunch_minutes=30,
+        teacher_blocks={"ab": [(clock(8), clock(9))]},
+    )
+    assert schedule["students"]["Start"].min() >= "09:00"
+    with pytest.raises(ValueError, match="Lærerspærringer") as error:
+        app.make_schedule(
+            [students[0]], teachers[:2], {"assignments": [["ab", "cd"]]}, clock(8), clock(8, 30), 20, 0, 0, 0, False,
+            lunch_mode="Flydende for alle lærere", lunch_minutes=30,
+            teacher_blocks={"ab": [(clock(8), clock(9))]},
+        )
+    assert "faste frokosttid" not in str(error.value)
+    assert "anden dag" in str(error.value)
+
+
 def test_floating_lunch_is_present_even_for_one_round():
     schedule = schedule_for_pairs([("ab", "cd")])
     lunches = schedule["timeline"][schedule["timeline"]["Type"] == "Frokostpause"]
     assert len(lunches) == 1
     assert schedule["settings"]["Planlagt tidsforbrug (min.)"] == 50
+
+
+def test_regular_pauses_are_in_teacher_plans_and_visual_gantt():
+    students = [student(name="A", student_id="E001"), student(name="B", student_id="E002")]
+    teachers = [teacher("ab", ("Dansk",)), teacher("cd", ("Historie",))]
+    schedule = app.make_schedule(
+        students, teachers, {"assignments": [["ab", "cd"], ["ab", "cd"]]}, clock(8), clock(12), 20, 1, 10, 0, False,
+        lunch_mode="Flydende for alle lærere", lunch_minutes=30,
+    )
+    pauses = schedule["teachers"][schedule["teachers"]["Type"] == "Pause"]
+    assert len(pauses) == 2
+    assert set(pauses["Lærer"]) == {"ab", "cd"}
+    assert ">Pause<" not in app.make_teacher_gantt_html(schedule, "ab")
+
+
+def test_floating_pauses_are_shared_before_and_after_lunch_without_visual_blocks():
+    students = [
+        student(name="A", student_id="E001"),
+        student(name="B", student_id="E002"),
+        student(name="C", student_id="E003"),
+    ]
+    teachers = [teacher("ab", ("Dansk",)), teacher("cd", ("Historie",)), teacher("ef", ("Matematik",))]
+    schedule = app.make_schedule(
+        students, teachers, {"assignments": [["ab", "cd"], ["cd", "ef"], ["ef", "ab"]]}, clock(8), clock(12), 20, 2, 10, 0, False,
+        lunch_mode="Flydende for alle lærere", lunch_minutes=30, floating_pauses=True,
+    )
+    pauses = schedule["teachers"][schedule["teachers"]["Type"] == "Pause"]
+    assert len(pauses) == 6
+    timeline_pauses = schedule["timeline"][schedule["timeline"]["Type"] == "Pause"]
+    lunch = schedule["timeline"][schedule["timeline"]["Type"] == "Frokostpause"].iloc[0]
+    assert len(timeline_pauses) == 2
+    assert timeline_pauses.iloc[0]["Slut"] <= lunch["Start"]
+    assert timeline_pauses.iloc[1]["Start"] >= lunch["Slut"]
+    assert schedule["settings"]["Pauser fordeles om frokost"] == "Ja"
+    assert ">Pause<" not in app.make_teacher_gantt_html(schedule, "ab")
 
 
 def test_schedule_upload_finds_later_sheet_and_normalises_teacher_label():
@@ -500,8 +609,48 @@ def test_schedule_exports_match_ui_frames_and_escape_html():
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
     assert "<script>alert(1)</script>" not in html
     workbook = pd.read_excel(io.BytesIO(app.make_schedule_excel(schedule)), sheet_name=None)
-    assert list(workbook) == ["Elevplan", "Lærerplan", "Tidslinje", "Lærerpar", "Indstillinger"]
+    assert list(workbook) == ["Elevplan", "Lærerplan", "ab", "cd", "ef", "gh", "Tidslinje", "Lærerpar", "Indstillinger"]
     assert len(workbook["Elevplan"]) == len(schedule["students"])
+    assert workbook["Lærerplan"]["Lærer"].tolist() == sorted(workbook["Lærerplan"]["Lærer"].tolist(), key=app.normal_key)
+    assert set(workbook["cd"]["Lærer"]) == {"cd"}
+
+
+def test_excel_teacher_sheet_names_are_safe_and_unique():
+    used = {"lærerplan"}
+    first = app.excel_sheet_name("Anne/Andersen [AB]", used)
+    second = app.excel_sheet_name("Anne/Andersen [AB]", used)
+    assert first == "Anne Andersen AB"
+    assert second == "Anne Andersen AB (2)"
+
+
+def test_student_lookup_html_and_teacher_gantt_include_search_and_co_teacher():
+    schedule = schedule_for_pairs([("ab", "cd")])
+    lookup = app.make_student_schedule_html(schedule)
+    assert 'id="query"' in lookup
+    assert "Elevnavn" in lookup
+    assert "Navn eller klasse" not in lookup
+    assert "3a" in lookup
+    assert "Bemærkninger/ændringer fra lærerne" not in lookup
+    assert app.compact_search_key("3.q") == "3q"
+    assert app.compact_search_key("s 2024q") == "s2024q"
+    assert "3q" in app.class_search_keys("S 2024q")
+    assert "s2024q" in app.class_search_keys("S 2024q")
+    assert "SOPtima – en algoritme udviklet af Henrik" in lookup
+    assert "Elev 1" in lookup
+    gantt = app.make_teacher_gantt_html(schedule, "ab")
+    assert "Medvejleder: cd" in gantt
+    teacher_html = app.make_schedule_html(schedule)
+    assert "<h1>Vejledningsplan</h1>" in teacher_html
+    assert "Fordelingen er foretaget ud fra SOPtima" in teacher_html
+    assert "hst@nextkhb.dk" in teacher_html
+    assert "teacher-link" in teacher_html
+    assert "teacherQuery.value=link.dataset.teacherSelect" in teacher_html
+    assert app.COPYRIGHT in teacher_html
+    assert 'id="teacher-query"' in teacher_html
+    assert 'id="teacher-agenda"' in teacher_html
+    assert 'id="teacher-agenda-rows"' in teacher_html
+    assert "agendaRows" in teacher_html
+    assert app.COPYRIGHT in lookup
 
 
 def test_demo_performance_and_invariants():
