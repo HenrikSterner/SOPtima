@@ -1185,13 +1185,21 @@ def _append_unplaced_html(factory: Any, schedule: dict[str, Any]) -> str:
 
 def make_schedule_excel_beta(schedule: dict[str, Any]) -> bytes:
     result = _CORE_MAKE_SCHEDULE_EXCEL(schedule)
-    frame = schedule.get("unplaced", pd.DataFrame())
-    if frame.empty:
-        return result
     from openpyxl import load_workbook
     from openpyxl.utils.dataframe import dataframe_to_rows
 
     workbook = load_workbook(BytesIO(result))
+    # Indstillingerne bruges internt af programmet, men hører ikke hjemme i
+    # den plan, der deles med lærerne.
+    if "Indstillinger" in workbook.sheetnames:
+        del workbook["Indstillinger"]
+
+    frame = schedule.get("unplaced", pd.DataFrame())
+    if frame.empty:
+        output = BytesIO()
+        workbook.save(output)
+        return output.getvalue()
+
     name = core.excel_sheet_name("Kræver anden dag", set(workbook.sheetnames))
     worksheet = workbook.create_sheet(name)
     for row in dataframe_to_rows(frame, index=False, header=True):
@@ -1211,6 +1219,9 @@ def _teacher_html_with_actions(
     dynamic_word: bool = False,
 ) -> str:
     document = _CORE_MAKE_SCHEDULE_HTML(schedule)
+    # Core-eksporten viser ellers alle beregnings- og inputindstillinger i
+    # introduktionen. De skal ikke følge med den delbare lærerplan.
+    document = re.sub(r"<ul>.*?</ul>", "", document, count=1, flags=re.S)
     documents = documents if documents is not None else (
         {} if dynamic_word else _word_documents(schedule, progress_callback=progress_callback)
     )
