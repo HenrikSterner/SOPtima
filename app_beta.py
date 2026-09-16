@@ -1300,6 +1300,13 @@ def _render_beta_planner() -> None:
         save_change(updated, {}, action="Fjern alle låse")
     st.caption("Flytningen låser aktiviteten. SOPtima bevarer først de øvrige tider og flytter kun aktiviteter, der nu er i konflikt. En ugyldig eller umulig flytning ender i blokken for aktiviteter, der kræver anden tid eller dag.")
 
+    st.subheader("Træk og slip i tidsplanen")
+    st.info(
+        "Træk den blå blok med elevens navn vandret til et nyt klokkeslæt, og slip den på lærerens række. "
+        "Farverne viser, om placeringen er ledig (grøn), kræver omplanlægning (gul) eller er ugyldig (rød). "
+        "Når du slipper, genberegnes planen automatisk. Hvis træk-og-slip ikke virker i din browser, kan du "
+        "bruge felterne ovenfor: vælg aktivitet, vælg nyt starttidspunkt, og tryk ‘Flyt og justér’."
+    )
     drag_items = [
         {"id": row["Aktivitets-ID"], "label": f"{row['Elev']} · {row['Klasse']}", "start": row["Start"], "end": row["Slut"]}
         for _, row in schedule["students"].iterrows()
