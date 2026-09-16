@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="da">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; font: 13px/1.35 system-ui, sans-serif; color: #1e2b33; background: transparent; }
+      #hint { margin: 0 0 7px; color: #51616b; }
+      #axis { position: relative; height: 22px; margin-left: 118px; color: #62727b; font-size: 11px; }
+      #axis span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+      #board { max-height: 620px; border: 1px solid #cbd5da; border-radius: 8px; overflow-y: auto; background: #fbfcfc; }
+      .lane { display: grid; grid-template-columns: 118px 1fr; min-height: 38px; border-top: 1px solid #e2e8eb; }
+      .lane:first-child { border-top: 0; }
+      .name { padding: 9px 8px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; background: #f2f6f7; border-right: 1px solid #dce5e8; }
+      .track { position: relative; min-height: 38px; background-image: linear-gradient(to right, #edf2f3 1px, transparent 1px); background-size: 10.4167% 100%; }
+      .track.drop-target { background-color: #e7f5ee; outline: 2px dashed #39845b; outline-offset: -2px; }
+      .track.drop-green { background-color: #e7f5ee; outline-color: #39845b; }
+      .track.drop-yellow { background-color: #fff6d8; outline-color: #c58a12; }
+      .track.drop-red { background-color: #fde8e7; outline-color: #b6423a; }
+      .block { position: absolute; top: 5px; height: 27px; padding: 5px 7px; border-radius: 5px; color: #fff; background: #227a8c; cursor: grab; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; user-select: none; box-shadow: 0 1px 2px #0003; }
+      .block:active { cursor: grabbing; opacity: .72; }
+      #empty { padding: 12px; color: #62727b; }
+    </style>
+  </head>
+  <body>
+    <p id="hint">Træk en vejledning til det ønskede tidspunkt. SOPtima validerer og justerer den øvrige plan automatisk.</p>
+    <div id="axis"></div>
+    <div id="board"></div>
+    <script>
+      const post = (type, extra = {}) => window.parent.postMessage({isStreamlitMessage: true, type, ...extra}, "*");
+      const minutes = value => { const [h, m] = value.split(":").map(Number); return h * 60 + m; };
+      const clock = value => `${String(Math.floor(value / 60)).padStart(2, "0")}:${String(value % 60).padStart(2, "0")}`;
+      let dragId = null;
+      let currentArgs = {};
+
+      function dropAssessment(track, event) {
+        const start = minutes(currentArgs.start || "08:00");
+        const end = minutes(currentArgs.end || "16:00");
+        const total = Math.max(1, end - start);
+        const step = Number(currentArgs.step || 5);
+        const rect = track.getBoundingClientRect();
+        const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+        const snapped = Math.round((ratio * total) / step) * step + start;
+        const target = clock(Math.min(end - step, snapped));
+        const status = (((currentArgs.validity || {})[dragId] || {})[target]) || "red";
+        return {target, status};
+      }
+
+      function clearDropClasses(track) {
+        track.classList.remove("drop-target", "drop-green", "drop-yellow", "drop-red");
+      }
+
+      function render(args) {
+        currentArgs = args;
+        const items = Array.isArray(args.items) ? args.items : [];
+        const start = minutes(args.start || "08:00");
+        const end = minutes(args.end || "16:00");
+        const total = Math.max(1, end - start);
+        const step = Number(args.step || 5);
+        const axis = document.getElementById("axis");
+        const board = document.getElementById("board");
+        axis.innerHTML = "";
+        board.innerHTML = "";
+        for (let point = start; point <= end; point += 60) {
+          const label = document.createElement("span");
+          label.style.left = `${((point - start) / total) * 100}%`;
+          label.textContent = clock(point);
+          axis.appendChild(label);
+        }
+        if (!items.length) {
+          board.innerHTML = '<div id="empty">Ingen planlagte vejledninger.</div>';
+          post("streamlit:setFrameHeight", {height: 90});
+          return;
+        }
+        for (const item of items) {
+          const lane = document.createElement("div");
+          lane.className = "lane";
+          const name = document.createElement("div");
+          name.className = "name";
+          name.textContent = item.label;
+          const track = document.createElement("div");
+          track.className = "track";
+          track.dataset.id = item.id;
+          const block = document.createElement("div");
+          block.className = "block";
+          block.draggable = true;
+          block.dataset.id = item.id;
+          const itemStart = minutes(item.start);
+          const itemEnd = minutes(item.end);
+          block.style.left = `${Math.max(0, ((itemStart - start) / total) * 100)}%`;
+          block.style.width = `${Math.max(4, ((itemEnd - itemStart) / total) * 100)}%`;
+          block.textContent = `${item.start} · ${item.label}`;
+          block.addEventListener("dragstart", event => {
+            dragId = event.currentTarget.dataset.id;
+            event.dataTransfer.effectAllowed = "move";
+          });
+          track.addEventListener("dragover", event => {
+            event.preventDefault();
+            clearDropClasses(track);
+            const assessment = dropAssessment(track, event);
+            track.classList.add("drop-target", `drop-${assessment.status}`);
+            track.title = assessment.status === "green" ? "Konfliktfri placering" : assessment.status === "yellow" ? "Andre aktiviteter flyttes" : "Ugyldig placering";
+          });
+          track.addEventListener("dragleave", () => clearDropClasses(track));
+          track.addEventListener("drop", event => {
+            event.preventDefault();
+            const assessment = dropAssessment(track, event);
+            clearDropClasses(track);
+            if (!dragId) return;
+            post("streamlit:setComponentValue", {value: {id: dragId, start: assessment.target, status: assessment.status, version: currentArgs.version}});
+            dragId = null;
+          });
+          track.appendChild(block);
+          lane.append(name, track);
+          board.appendChild(lane);
+        }
+        post("streamlit:setFrameHeight", {height: Math.min(680, 58 + items.length * 39)});
+      }
+
+      window.addEventListener("message", event => {
+        if (event.data && event.data.type === "streamlit:render") render(event.data.args || {});
+      });
+      post("streamlit:componentReady", {apiVersion: 1});
+    </script>
+  </body>
+</html>

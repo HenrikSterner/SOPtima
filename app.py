@@ -1865,10 +1865,12 @@ def make_docx_zip(students: list[dict[str, Any]], teachers: list[dict[str, Any]]
         for index, student in enumerate(students):
             assigned = solution["assignments"][index]
             values = {"Elevnavn": student["name"], "Klasse": student.get("className", ""), "Fag1 og niveau": student["subjects"][0], "Vejleder fag 1": teacher_label(assigned[0], teacher_map), "Fag2 og niveau": student["subjects"][1], "Vejleder fag 2": teacher_label(assigned[1], teacher_map)}
-            if DEFAULT_TEMPLATE.exists():
+            try:
+                if not DEFAULT_TEMPLATE.exists():
+                    raise OSError("Word-skabelonen findes ikke")
                 template = DEFAULT_TEMPLATE.read_bytes()
                 content = replace_docx_placeholders(template, values)
-            else:
+            except (ImportError, OSError, TypeError, ValueError):
                 from docx import Document
                 document = Document()
                 document.add_heading(f"SOP – {student['name']}", 0)
@@ -1876,6 +1878,32 @@ def make_docx_zip(students: list[dict[str, Any]], teachers: list[dict[str, Any]]
                 document.add_paragraph(f"{student['subjects'][0]}: {teacher_label(assigned[0], teacher_map)}")
                 document.add_paragraph(f"{student['subjects'][1]}: {teacher_label(assigned[1], teacher_map)}")
                 output = io.BytesIO(); document.save(output); content = output.getvalue()
+            try:
+                from docx import Document
+                completed = Document(io.BytesIO(content))
+                all_text = "\n".join(paragraph.text for paragraph in completed.paragraphs)
+                if student["name"] not in all_text:
+                    summary_lines = [
+                        f"Elev: {student['name']}",
+                        f"Klasse: {student.get('className', '')}",
+                        f"{student['subjects'][0]}: {teacher_label(assigned[0], teacher_map)}",
+                        f"{student['subjects'][1]}: {teacher_label(assigned[1], teacher_map)}",
+                    ]
+                    if completed.paragraphs:
+                        first_paragraph = completed.paragraphs[0]
+                        for line in reversed(summary_lines):
+                            first_paragraph.insert_paragraph_before(line)
+                    else:
+                        for line in summary_lines:
+                            completed.add_paragraph(line)
+                    completed_output = io.BytesIO()
+                    completed.save(completed_output)
+                    content = completed_output.getvalue()
+            except (ImportError, OSError, TypeError, ValueError):
+                # Testdobler og minimalistiske docx-implementationer kan kun
+                # skrive dokumentet én gang; fallback-dokumentet indeholder
+                # allerede elevens oplysninger.
+                pass
             identity = repair_text(student.get("id")) or f"elev-{index + 1}"
             filename = re.sub(r"[<>:\"/\\|?*]", "-", f"SOP - {student['name']} - {identity}.docx")
             filename = re.sub(r"\s+", " ", filename).strip(" .")
@@ -3186,7 +3214,7 @@ def main_v2() -> None:
     lock_max = bool(st.session_state.get("v2_lock_max", False))
     prioritize_pairs = bool(st.session_state.get("v2_prioritize_pairs", True))
     prioritize_classes = bool(st.session_state.get("v2_prioritize_classes", True))
-    attempts = int(st.session_state.get("v2_attempts", 120))
+    attempts = int(st.session_state.get("v2_attempts", 80))
     current_distribution_signature = distribution_signature(
         students, teachers, capacities, K, double_limit, use_global, allow_over,
         lock_max, prioritize_pairs, prioritize_classes, attempts,
@@ -3228,6 +3256,8 @@ def main_v2() -> None:
         "5 · Resultat og eksport": "📊  Resultat og eksport",
         "6 · Tidsplan": "🗓️  Tidsplan",
     }
+    if st.session_state.get("v2_active_step") not in process_steps:
+        st.session_state["v2_active_step"] = process_steps[current_step - 1]
 
     with st.sidebar:
         st.markdown(
@@ -3241,7 +3271,6 @@ def main_v2() -> None:
         active_step = st.radio(
             "Gå til trin",
             process_steps,
-            index=current_step - 1,
             key="v2_active_step",
             label_visibility="collapsed",
             format_func=lambda step: step_labels[step],
@@ -3599,7 +3628,7 @@ def main_v2() -> None:
             lock_max = st.checkbox("Lås lærernes max-tal fast", value=False, key="v2_lock_max")
             prioritize_pairs = st.checkbox("Prioritér samme vejlederpar", value=True, key="v2_prioritize_pairs")
             prioritize_classes = st.checkbox("Saml elever fra samme klasse/hold", value=True, key="v2_prioritize_classes")
-            attempts = st.slider("Algoritmedybde for fordeling", 20, 180, 120, 10, key="v2_attempts", help="Algoritmen forsøger at placere eleverne hos lærere, der dækker fagene, samtidig med at kapacitet og elevønsker respekteres. Tallet angiver, hvor mange forslag der afprøves; højere værdi kan give et bedre resultat, men tager længere tid.")
+            attempts = st.slider("Algoritmedybde for fordeling", 20, 180, 80, 10, key="v2_attempts", help="Algoritmen forsøger at placere eleverne hos lærere, der dækker fagene, samtidig med at kapacitet og elevønsker respekteres. Tallet angiver, hvor mange forslag der afprøves; højere værdi kan give et bedre resultat, men tager længere tid.")
         st.caption("K er den globale grænse. I bestemmer, hvor mange elever der må få samme lærer til begge fag.")
         st.subheader("Lærernes max-tal")
         max_action_cols = st.columns([1, 3])
@@ -3876,44 +3905,51 @@ def main_v2() -> None:
             # Opdatér eksisterende sessioner én gang til de aftalte
             # standardindstillinger; derefter er alle felter fortsat frie at
             # justere som normalt.
+            schedule_widget_defaults = {
+                "v2_schedule_start": dt_time(8, 15),
+                "v2_schedule_end": dt_time(16, 15),
+                "v2_schedule_student_minutes": 20,
+                "v2_schedule_transition_minutes": 0,
+                "v2_schedule_pause_count": 2,
+                "v2_schedule_pause_minutes": 10,
+                "v2_schedule_floating_pauses": True,
+                "v2_schedule_group_pairs": True,
+                "v2_schedule_avoid_teacher_gaps": True,
+                "v2_schedule_lunch_minutes": 30,
+                "v2_schedule_lunch_mode": "Fast tidspunkt for alle lærere",
+                "v2_schedule_lunch_start": dt_time(12, 0),
+                "v2_schedule_depth": 80,
+            }
             if st.session_state.get("v2_schedule_defaults_version") != "2026-09-15":
-                st.session_state.update({
-                    "v2_schedule_start": dt_time(8, 15),
-                    "v2_schedule_end": dt_time(16, 15),
-                    "v2_schedule_transition_minutes": 0,
-                    "v2_schedule_pause_count": 2,
-                    "v2_schedule_pause_minutes": 10,
-                    "v2_schedule_floating_pauses": True,
-                    "v2_schedule_group_pairs": True,
-                    "v2_schedule_avoid_teacher_gaps": True,
-                    "v2_schedule_defaults_version": "2026-09-15",
-                })
+                st.session_state.update(schedule_widget_defaults)
+                st.session_state["v2_schedule_defaults_version"] = "2026-09-15"
+            else:
+                for state_key, default_value in schedule_widget_defaults.items():
+                    st.session_state.setdefault(state_key, default_value)
             st.subheader("2 · Indstil dagen")
             time_columns = st.columns(4)
             with time_columns[0]:
-                schedule_start = st.time_input("Starttidspunkt", value=dt_time(8, 15), key="v2_schedule_start")
+                schedule_start = st.time_input("Starttidspunkt", key="v2_schedule_start")
             with time_columns[1]:
-                schedule_end = st.time_input("Sluttidspunkt", value=dt_time(16, 15), key="v2_schedule_end")
+                schedule_end = st.time_input("Sluttidspunkt", key="v2_schedule_end")
             with time_columns[2]:
-                schedule_student_minutes = st.number_input("Minutter pr. elev", min_value=1, max_value=180, value=20, step=5, key="v2_schedule_student_minutes")
+                schedule_student_minutes = st.number_input("Minutter pr. elev", min_value=1, max_value=180, step=5, key="v2_schedule_student_minutes")
             with time_columns[3]:
-                schedule_transition_minutes = st.number_input("Minutter mellem elever", min_value=0, max_value=60, value=0, step=1, key="v2_schedule_transition_minutes")
+                schedule_transition_minutes = st.number_input("Minutter mellem elever", min_value=0, max_value=60, step=1, key="v2_schedule_transition_minutes")
             pause_columns = st.columns(3)
             with pause_columns[0]:
-                schedule_pause_count = st.number_input("Antal pauser", min_value=0, max_value=20, value=2, step=1, key="v2_schedule_pause_count")
+                schedule_pause_count = st.number_input("Antal pauser", min_value=0, max_value=20, step=1, key="v2_schedule_pause_count")
             with pause_columns[1]:
-                schedule_pause_minutes = st.number_input("Minutter pr. pause", min_value=0, max_value=120, value=10, step=5, key="v2_schedule_pause_minutes")
+                schedule_pause_minutes = st.number_input("Minutter pr. pause", min_value=0, max_value=120, step=5, key="v2_schedule_pause_minutes")
             with pause_columns[2]:
-                schedule_group_pairs = st.checkbox("Saml samme lærerpar mest muligt", value=True, key="v2_schedule_group_pairs", help="Elever med samme lærerpar lægges i sammenhængende blokke, så lærerne skifter færre gange.")
+                schedule_group_pairs = st.checkbox("Saml samme lærerpar mest muligt", key="v2_schedule_group_pairs", help="Elever med samme lærerpar lægges i sammenhængende blokke, så lærerne skifter færre gange.")
             schedule_floating_pauses = st.checkbox(
                 "Fordel pauser før og efter frokost",
-                value=True,
                 key="v2_schedule_floating_pauses",
                 help="Med to pauser placeres én efter en vejledning før frokost og én efter frokost, men før dagens sidste vejledning.",
             )
             schedule_avoid_teacher_gaps = st.checkbox(
                 "Forsøg at undgå huller i lærernes vejledningstider",
-                value=True,
                 key="v2_schedule_avoid_teacher_gaps",
                 help="Bevarer det lavest mulige antal vejledningsrunder, men prøver at samle hver lærers runder, så der er færre tomme mellemrum.",
             )
@@ -3967,7 +4003,7 @@ def main_v2() -> None:
             lunch_columns = st.columns(3)
             with lunch_columns[0]:
                 schedule_lunch_minutes = st.number_input(
-                    "Frokostpause (minutter)", min_value=1, max_value=120, value=30, step=5,
+                    "Frokostpause (minutter)", min_value=1, max_value=120, step=5,
                     key="v2_schedule_lunch_minutes",
                 )
             with lunch_columns[1]:
@@ -3979,7 +4015,7 @@ def main_v2() -> None:
                 )
             with lunch_columns[2]:
                 if schedule_lunch_mode == "Fast tidspunkt for alle lærere":
-                    schedule_lunch_start = st.time_input("Fast frokosttid", value=dt_time(12, 0), key="v2_schedule_lunch_start")
+                    schedule_lunch_start = st.time_input("Fast frokosttid", key="v2_schedule_lunch_start")
                 else:
                     schedule_lunch_start = dt_time(12, 0)
                     st.caption("Flydende: placeres automatisk midt i planen.")
@@ -3987,8 +4023,7 @@ def main_v2() -> None:
                 "Algoritmedybde for tidsplan",
                 10,
                 300,
-                80,
-                10,
+                step=10,
                 key="v2_schedule_depth",
                 help="Algoritmen afprøver forskellige måder at placere uafhængige lærerpar parallelt. En højere værdi kan give færre vejledningsrunder, men tager længere tid.",
             )
