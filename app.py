@@ -4073,6 +4073,90 @@ def main_v2() -> None:
                     st.error(str(error))
             schedule = st.session_state.get("v2_schedule")
             if schedule is not None:
+                # Gør de vigtigste eksportmuligheder synlige umiddelbart efter
+                # beskeden om, at tidsplanen er genereret.
+                st.subheader("Eksportér den beregnede tidsplan")
+                export_key = stable_signature([
+                    current_schedule_signature,
+                    schedule.get("beta", {}).get("version", 0),
+                ])
+                cached_exports = st.session_state.get("v2_schedule_exports")
+                if not isinstance(cached_exports, dict) or cached_exports.get("key") != export_key:
+                    st.session_state["v2_schedule_exports"] = {
+                        "key": export_key,
+                        "teacher_html": None,
+                        "student_html": None,
+                        "excel": None,
+                    }
+                    cached_exports = st.session_state["v2_schedule_exports"]
+                teacher_html_data = cached_exports["teacher_html"]
+                student_html_data = cached_exports["student_html"]
+                excel_data = cached_exports["excel"]
+                export_columns = st.columns(3)
+                with export_columns[0]:
+                    if teacher_html_data is None and st.button(
+                        "Klargør lærerplan som HTML", type="primary", key="v2_prepare_schedule_html_top"
+                    ):
+                        progress = st.progress(0.1, text="Genererer lærer-HTML …")
+                        def report_word_progress(completed: int, total: int) -> None:
+                            fraction = 0.1 + 0.85 * completed / max(1, total)
+                            progress.progress(
+                                min(0.95, fraction),
+                                text=f"Genererer Word-fil {completed} af {total} …",
+                            )
+                        try:
+                            teacher_html = make_schedule_html(schedule, progress_callback=report_word_progress)
+                        except TypeError as error:
+                            if "progress_callback" not in str(error):
+                                raise
+                            teacher_html = make_schedule_html(schedule)
+                        teacher_html_data = teacher_html.encode("utf-8")
+                        progress.progress(1.0, text="Lærer-HTML er klar til download")
+                        cached_exports["teacher_html"] = teacher_html_data
+                        st.session_state["v2_schedule_exports"] = cached_exports
+                    if teacher_html_data is not None:
+                        st.download_button(
+                            "Download tidsplan som HTML",
+                            data=teacher_html_data,
+                            file_name="Vejledningsplan (SOPtima beta af Henrik Sterner).html",
+                            mime="text/html", type="primary", key="v2_download_schedule_html_top",
+                        )
+                with export_columns[1]:
+                    if student_html_data is None and st.button(
+                        "Klargør elevopslag som HTML", type="primary", key="v2_prepare_student_schedule_html_top"
+                    ):
+                        progress = st.progress(0.1, text="Genererer elev-HTML …")
+                        student_html_data = make_student_schedule_html(schedule).encode("utf-8")
+                        progress.progress(1.0, text="Elevopslaget er klar til download")
+                        cached_exports["student_html"] = student_html_data
+                        st.session_state["v2_schedule_exports"] = cached_exports
+                    if student_html_data is not None:
+                        st.download_button(
+                            "Download elevopslag som HTML",
+                            data=student_html_data,
+                            file_name="elevopslag-vejledning.html",
+                            mime="text/html", type="primary", key="v2_download_student_schedule_html_top",
+                        )
+                with export_columns[2]:
+                    if excel_data is None and st.button(
+                        "Klargør tidsplan som Excel", type="primary", key="v2_prepare_schedule_excel_top"
+                    ):
+                        progress = st.progress(0.1, text="Genererer Excel-fil …")
+                        excel_data = try_excel_export(lambda: make_schedule_excel(schedule))
+                        if excel_data is not None:
+                            progress.progress(1.0, text="Excel-filen er klar til download")
+                            cached_exports["excel"] = excel_data
+                            st.session_state["v2_schedule_exports"] = cached_exports
+                        else:
+                            st.error("Excel-download kræver openpyxl. Installer projektets requirements.txt for at aktivere eksporten.")
+                    if excel_data is not None:
+                        st.download_button(
+                            "Download tidsplan som Excel",
+                            data=excel_data,
+                            file_name="vejledningsplan.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            type="primary", key="v2_download_schedule_excel_top",
+                        )
                 settings = schedule["settings"]
                 metric_columns = st.columns(4)
                 metric_columns[0].metric("Elever", len(schedule["students"]))
@@ -4102,38 +4186,6 @@ def main_v2() -> None:
                     st.dataframe(schedule["timeline"], width="stretch", hide_index=True, height=560)
                 with schedule_pairs:
                     st.dataframe(schedule["pairs"], width="stretch", hide_index=True)
-                download_columns = st.columns(3)
-                with download_columns[0]:
-                    st.download_button(
-                        "Download tidsplan som HTML",
-                        data=make_schedule_html(schedule).encode("utf-8"),
-                        file_name="Vejledningsplan (SOPtima beta af Henrik Sterner).html",
-                        mime="text/html",
-                        type="primary",
-                        key="v2_download_schedule_html",
-                    )
-                with download_columns[1]:
-                    st.download_button(
-                        "Download elevopslag som HTML",
-                        data=make_student_schedule_html(schedule).encode("utf-8"),
-                        file_name="elevopslag-vejledning.html",
-                        mime="text/html",
-                        type="primary",
-                        key="v2_download_student_schedule_html",
-                    )
-                with download_columns[2]:
-                    schedule_export = try_excel_export(lambda: make_schedule_excel(schedule))
-                    if schedule_export is not None:
-                        st.download_button(
-                            "Download tidsplan som Excel",
-                            data=schedule_export,
-                            file_name="vejledningsplan.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            type="primary",
-                            key="v2_download_schedule_excel",
-                        )
-                    else:
-                        st.error("Excel-download kræver openpyxl. Installer projektets requirements.txt for at aktivere eksporten.")
 
     st.divider()
     active_index = process_steps.index(active_step)

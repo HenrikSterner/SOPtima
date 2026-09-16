@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import io
+import base64
+import re
+import shutil
+import subprocess
 import zipfile
 from datetime import datetime, time as clock
 
@@ -194,6 +198,19 @@ def test_independent_teacher_pairs_can_run_in_parallel():
     assert schedule["students"]["Start"].nunique() == 1
 
 
+def test_morning_teacher_block_keeps_unaffected_pairs_as_early_as_possible():
+    schedule, _ = make_beta_schedule(
+        [("a", "b")] * 4 + [("c", "d")] * 4,
+        end=clock(12),
+        teacher_blocks={"a": [(clock(8), clock(10))]},
+    )
+    rows = schedule["students"]
+    unaffected = rows[rows["Vejleder 1"].str.contains("C", case=False, regex=False)]
+    affected = rows[rows["Vejleder 1"].str.contains("A", case=False, regex=False)]
+    assert unaffected["Start"].map(minutes).max() < 10 * 60
+    assert affected["Start"].map(minutes).min() >= 10 * 60
+
+
 def test_move_assessment_and_dynamic_repair():
     schedule, context = make_beta_schedule([("a", "b")] * 3)
     ids = schedule["activities"]["activity_id"].tolist()
@@ -288,13 +305,17 @@ def test_teacher_html_has_word_and_teams_actions_but_unplaced_has_none():
     teacher_html = beta.make_schedule_html_beta(schedule)
     assert "Download Word" in teacher_html
     assert "Åbn Teams-chat" in teacher_html
-    assert 'id="word-documents"' in teacher_html
-    assert "data-word-id=" in teacher_html
+    assert 'id="dynamic-word-values"' in teacher_html
+    assert "data-dynamic-word-id=" in teacher_html
+    assert "createWordDocument" in teacher_html
+    assert 'id="dynamic-word-template"' in teacher_html
+    assert "word/document.xml" in teacher_html
+    assert 'id="word-documents"' not in teacher_html
     assert "Kan ikke placeres inden for det valgte tidsrum" in teacher_html
     assert teacher_html.count("Download Word") == len(schedule["teachers"][schedule["teachers"]["Type"] == "Vejledning"])
 
 
-def test_teacher_export_package_contains_html_and_valid_unique_word_files():
+def test_teacher_export_package_contains_only_html_with_dynamic_unique_word_downloads():
     students = [
         student(1, name="Samme/Navn", email="one@edu.nextkbh.dk"),
         student(2, name="Samme/Navn", email="two@edu.nextkbh.dk"),
@@ -306,16 +327,71 @@ def test_teacher_export_package_contains_html_and_valid_unique_word_files():
     package = beta.make_teacher_export_package(schedule)
     with zipfile.ZipFile(io.BytesIO(package)) as archive:
         names = archive.namelist()
-        assert "Vejledningsplan.html" in names
-        word_names = [name for name in names if name.startswith("Word/")]
-        assert len(word_names) == 2
-        assert len(set(word_names)) == 2
-        assert all("/" not in name.removeprefix("Word/") for name in word_names)
-        document = Document(io.BytesIO(archive.read(word_names[0])))
-        text = "\n".join(paragraph.text for paragraph in document.paragraphs)
-        assert "Samme/Navn" in text
+        assert names == ["Vejledningsplan.html"]
         package_html = archive.read("Vejledningsplan.html").decode("utf-8")
-        assert "Word/SOP%20-%20Samme-Navn" in package_html
+        assert "createWordDocument" in package_html
+        assert "data-dynamic-word-id=" in package_html
+        assert "SOP-Samme-Navn-S 2024q-A-E001.docx" in package_html
+        assert "SOP-Samme-Navn-S 2024q-A-E002.docx" in package_html
+        assert "Word/" not in package_html
+        embedded = re.search(r'<script id="dynamic-word-template" type="text/plain">([^<]+)</script>', package_html)
+        assert embedded
+        assert base64.b64decode(embedded.group(1)) == app.DEFAULT_TEMPLATE.read_bytes()
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js kræves for at afprøve den indlejrede Word-generator")
+def test_dynamic_word_download_uses_template_and_replaces_all_schedule_fields():
+    schedule, _ = make_beta_schedule([("a", "b")])
+    teacher_html = beta.make_schedule_html_beta(schedule)
+    node_script = r"""
+const input=await new Promise(resolve=>{let value='';process.stdin.setEncoding('utf8');process.stdin.on('data',part=>value+=part);process.stdin.on('end',()=>resolve(value));});
+const scripts=[...input.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)].map(match=>match[1]);
+const values=input.match(/<script id="dynamic-word-values" type="application\/json">([\s\S]*?)<\/script>/)?.[1];
+const template=input.match(/<script id="dynamic-word-template" type="text\/plain">([\s\S]*?)<\/script>/)?.[1];
+const generator=scripts.find(script=>script.includes('function wordTemplateFiles'));
+if(!values||!template||!generator)throw new Error('Mangler indlejret Word-generator');
+global.document={getElementById:id=>({textContent:id==='dynamic-word-values'?values:template}),querySelectorAll:()=>[]};
+const item=Object.values(JSON.parse(values))[0];
+const bytes=await eval(`(async()=>{${generator};return await createWordDocument(${JSON.stringify(item)});})()`);
+process.stdout.write(Buffer.from(bytes).toString('base64'));
+"""
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", node_script], input=teacher_html,
+        text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    word_bytes = base64.b64decode(result.stdout)
+    with zipfile.ZipFile(io.BytesIO(word_bytes)) as document:
+        assert "word/media/image1.png" in document.namelist()
+        xml = document.read("word/document.xml").decode("utf-8")
+    Document(io.BytesIO(word_bytes))
+    assert "Elev 1" in xml
+    assert "S 2024q" in xml
+    assert "Dansk A" in xml and "Historie B" in xml
+    first = schedule["students"].iloc[0]
+    assert str(first["Vejleder 1"]) in xml
+    assert str(first["Vejleder 2"]) in xml
+    for placeholder in ("Elevnavn", "Fag1 og niveau", "Vejleder fag 1", "Fag2 og niveau", "Vejleder fag 2"):
+        assert placeholder not in xml
+
+
+def test_batch_word_utility_reports_progress_for_each_planned_student():
+    schedule, _ = make_beta_schedule([("a", "b"), ("a", "b")])
+    progress = []
+    documents = beta._word_documents(schedule, progress_callback=lambda completed, total: progress.append((completed, total)))
+    assert len(documents) == 2
+    assert progress == [(1, 2), (2, 2)]
+
+
+def test_teacher_package_never_prebuilds_word_documents(monkeypatch):
+    schedule, _ = make_beta_schedule([("a", "b")])
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("Word-dokumenter må ikke bygges under HTML-eksporten")
+
+    monkeypatch.setattr(beta, "_word_documents", fail_if_called)
+    package = beta.make_teacher_export_package(schedule)
+    assert package
 
 
 def test_excel_and_both_html_exports_include_unplaced_block():
@@ -353,7 +429,7 @@ def test_schedule_template_contains_teams_email_columns():
 def test_single_student_word_filename_is_exact_requirement():
     schedule, _ = make_beta_schedule([("a", "b")])
     documents = beta._word_documents(schedule)
-    assert [item["filename"] for item in documents.values()] == ["SOP - Elev 1.docx"]
+    assert [item["filename"] for item in documents.values()] == ["SOP-Elev 1.docx"]
 
 
 def test_unplaced_activity_has_neither_teams_link_nor_word_document():

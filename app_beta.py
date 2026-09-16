@@ -400,7 +400,9 @@ def _build_beta_schedule(
         requested = None
         if activity["id"] in locked_activities:
             requested = _parse_clock(locked_activities[activity["id"]])
-        preferred = requested if requested is not None else activity["base_start"]
+        # Kun manuelt låste flytninger har en fast ønsket tid. Alle øvrige
+        # aktiviteter finder det tidligst mulige lovlige tidspunkt.
+        preferred = requested
         slot = _find_first_slot(
             activity, student_minutes, plan_start, plan_end, placed, breaks, teacher_blocks,
             transition_minutes, preferred,
@@ -943,20 +945,27 @@ def _safe_docx_name(value: Any) -> str:
     return re.sub(r"\s+", " ", cleaned).strip(" .") or "Elev"
 
 
-def _word_documents(schedule: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def _word_documents(schedule: dict[str, Any], progress_callback: Any = None) -> dict[str, dict[str, Any]]:
     """Generér én Word-fil for hver planlagt aktivitet."""
     result: dict[str, dict[str, Any]] = {}
     frame = schedule.get("students", pd.DataFrame())
     if frame.empty:
         return result
+    try:
+        template_bytes = core.DEFAULT_TEMPLATE.read_bytes() if core.DEFAULT_TEMPLATE.exists() else None
+    except OSError:
+        template_bytes = None
     name_counts = Counter(core.normal_key(value) for value in frame["Elev"].tolist())
     used_names: set[str] = set()
-    for _, row in frame.iterrows():
+    total = len(frame)
+    for position, (_, row) in enumerate(frame.iterrows(), 1):
         activity_id = str(row.get("Aktivitets-ID", ""))
         if not activity_id:
+            if progress_callback:
+                progress_callback(position, total)
             continue
         student_name = core.repair_text(row.get("Elev"))
-        base = f"SOP - {_safe_docx_name(student_name)}"
+        base = f"SOP-{_safe_docx_name(student_name)}"
         if name_counts[core.normal_key(student_name)] > 1:
             base += f" - {_safe_docx_name(row.get('Klasse') or activity_id)}"
         filename = f"{base}.docx"
@@ -974,9 +983,9 @@ def _word_documents(schedule: dict[str, Any]) -> dict[str, dict[str, Any]]:
             "Vejleder fag 2": core.repair_text(row.get("Vejleder 2")),
         }
         try:
-            if not core.DEFAULT_TEMPLATE.exists():
+            if template_bytes is None:
                 raise OSError("Word-skabelonen findes ikke")
-            content = core.replace_docx_placeholders(core.DEFAULT_TEMPLATE.read_bytes(), values)
+            content = core.replace_docx_placeholders(template_bytes, values)
         except (ImportError, OSError, TypeError, ValueError):
             from docx import Document
 
@@ -1010,6 +1019,8 @@ def _word_documents(schedule: dict[str, Any]) -> dict[str, dict[str, Any]]:
         completed.save(completed_output)
         content = completed_output.getvalue()
         result[activity_id] = {"filename": filename, "content": content}
+        if progress_callback:
+            progress_callback(position, total)
     return result
 
 
@@ -1019,9 +1030,15 @@ def _action_html(
     documents: dict[str, dict[str, Any]],
     *,
     embedded_word: bool,
+    dynamic_word: bool = False,
 ) -> str:
     document = documents.get(activity_id)
-    if document:
+    if dynamic_word:
+        word_action = (
+            f'<a class="action action-word" href="#" '
+            f'data-dynamic-word-id="{html.escape(activity_id, quote=True)}">Download Word</a>'
+        )
+    elif document:
         if embedded_word:
             word_href = "#"
             word_data = f' data-word-id="{html.escape(activity_id, quote=True)}"'
@@ -1045,6 +1062,104 @@ def _action_html(
             f'<span class="action action-disabled" title="{html.escape(teams_error, quote=True)}">Åbn Teams-chat</span>'
         )
     return f'<div class="actions">{word_action}{teams_action}</div>'
+
+
+def _dynamic_word_script(schedule: dict[str, Any]) -> str:
+    """Indlejr Word-skabelonen og opret en elevudgave af den ved klik."""
+    frame = schedule.get("students", pd.DataFrame())
+    name_counts = Counter(core.normal_key(value) for value in frame.get("Elev", pd.Series(dtype=str)).tolist())
+    name_class_counts = Counter(
+        (core.normal_key(row.get("Elev")), core.normal_key(row.get("Klasse")))
+        for _, row in frame.fillna("").iterrows()
+    )
+    values: dict[str, dict[str, str]] = {}
+    for _, row in frame.fillna("").iterrows():
+        activity_id = str(row.get("Aktivitets-ID", ""))
+        if not activity_id:
+            continue
+        name = core.repair_text(row.get("Elev"))
+        filename = f"SOP-{_safe_docx_name(name)}"
+        if name_counts[core.normal_key(name)] > 1:
+            filename += f"-{_safe_docx_name(row.get('Klasse') or activity_id)}"
+        if name_class_counts[(core.normal_key(name), core.normal_key(row.get("Klasse")))] > 1:
+            filename += f"-{_safe_docx_name(activity_id)}"
+        values[activity_id] = {
+            "filename": f"{filename}.docx",
+            "elev": name,
+            "klasse": core.repair_text(row.get("Klasse")),
+            "fag1": core.repair_text(row.get("Fag 1")),
+            "vejleder1": core.repair_text(row.get("Vejleder 1")),
+            "fag2": core.repair_text(row.get("Fag 2")),
+            "vejleder2": core.repair_text(row.get("Vejleder 2")),
+        }
+    # JSON-dataen ligger i et script-element. Kod HTML-tegnene eksplicit, så et
+    # elevnavn aldrig kan afslutte eller oprette HTML, selv hvis filen åbnes
+    # direkte i en browser.
+    payload = json.dumps(values, ensure_ascii=True, separators=(",", ":"))
+    payload = payload.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    try:
+        template_bytes = core.DEFAULT_TEMPLATE.read_bytes()
+    except OSError:
+        template_bytes = b""
+    template_payload = base64.b64encode(template_bytes).decode("ascii")
+    script = r"""<script id="dynamic-word-values" type="application/json">__WORD_VALUES__</script>
+<script id="dynamic-word-template" type="text/plain">__WORD_TEMPLATE__</script>
+<script>
+const dynamicWordValues=JSON.parse(document.getElementById('dynamic-word-values').textContent);
+const wordEncoder=new TextEncoder();
+const wordDecoder=new TextDecoder();
+const wordCrcTable=(()=>{const table=new Uint32Array(256);for(let i=0;i<256;i++){let c=i;for(let j=0;j<8;j++)c=(c&1)?0xedb88320^(c>>>1):c>>>1;table[i]=c>>>0;}return table;})();
+function wordCrc32(bytes){let c=0xffffffff;for(const value of bytes)c=wordCrcTable[(c^value)&255]^(c>>>8);return(c^0xffffffff)>>>0;}
+function wordXml(value){return String(value||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');}
+function wordBase64(value){const text=atob(value);const bytes=new Uint8Array(text.length);for(let i=0;i<text.length;i++)bytes[i]=text.charCodeAt(i);return bytes;}
+function wordZip(files){
+  const local=[],central=[];let offset=0,centralSize=0;
+  for(const file of files){
+    const nameBytes=wordEncoder.encode(file.name),data=file.data,crc=file.crc===undefined?wordCrc32(data):file.crc,method=file.method||0,flags=file.flags||0,size=file.size===undefined?data.length:file.size;
+    const header=new Uint8Array(30);const view=new DataView(header.buffer);
+    view.setUint32(0,0x04034b50,true);view.setUint16(4,20,true);view.setUint16(6,flags,true);view.setUint16(8,method,true);view.setUint16(10,file.time||0,true);view.setUint16(12,file.date||0,true);view.setUint32(14,crc,true);view.setUint32(18,data.length,true);view.setUint32(22,size,true);view.setUint16(26,nameBytes.length,true);
+    local.push(header,nameBytes,data);
+    const directory=new Uint8Array(46);const dirView=new DataView(directory.buffer);
+    dirView.setUint32(0,0x02014b50,true);dirView.setUint16(4,20,true);dirView.setUint16(6,20,true);dirView.setUint16(8,flags,true);dirView.setUint16(10,method,true);dirView.setUint16(12,file.time||0,true);dirView.setUint16(14,file.date||0,true);dirView.setUint32(16,crc,true);dirView.setUint32(20,data.length,true);dirView.setUint32(24,size,true);dirView.setUint16(28,nameBytes.length,true);dirView.setUint32(42,offset,true);
+    central.push(directory,nameBytes);offset+=header.length+nameBytes.length+data.length;centralSize+=directory.length+nameBytes.length;
+  }
+  const end=new Uint8Array(22);const endView=new DataView(end.buffer);endView.setUint32(0,0x06054b50,true);endView.setUint16(8,Object.keys(files).length,true);endView.setUint16(10,Object.keys(files).length,true);endView.setUint32(12,centralSize,true);endView.setUint32(16,offset,true);
+  const total=offset+centralSize+end.length,out=new Uint8Array(total);let cursor=0;
+  for(const chunk of [...local,...central,end]){out.set(chunk,cursor);cursor+=chunk.length;}return out;
+}
+function wordTemplateFiles(bytes){
+  const view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);let eocd=-1;
+  for(let i=bytes.length-22;i>=Math.max(0,bytes.length-65557);i--){if(view.getUint32(i,true)===0x06054b50){eocd=i;break;}}
+  if(eocd<0)throw new Error('Word-skabelonen er ikke en gyldig DOCX-fil.');
+  const count=view.getUint16(eocd+10,true),start=view.getUint32(eocd+16,true),files=[];let cursor=start;
+  for(let index=0;index<count;index++){
+    if(view.getUint32(cursor,true)!==0x02014b50)throw new Error('Word-skabelonen kan ikke læses.');
+    const flags=view.getUint16(cursor+8,true),method=view.getUint16(cursor+10,true),time=view.getUint16(cursor+12,true),date=view.getUint16(cursor+14,true),crc=view.getUint32(cursor+16,true),compressedSize=view.getUint32(cursor+20,true),size=view.getUint32(cursor+24,true),nameLength=view.getUint16(cursor+28,true),extraLength=view.getUint16(cursor+30,true),commentLength=view.getUint16(cursor+32,true),localOffset=view.getUint32(cursor+42,true);
+    const name=wordDecoder.decode(bytes.slice(cursor+46,cursor+46+nameLength));const localNameLength=view.getUint16(localOffset+26,true),localExtraLength=view.getUint16(localOffset+28,true),dataStart=localOffset+30+localNameLength+localExtraLength;
+    files.push({name,flags,method,time,date,crc,size,data:bytes.slice(dataStart,dataStart+compressedSize)});cursor+=46+nameLength+extraLength+commentLength;
+  }return files;
+}
+async function wordInflate(file){
+  if(file.method===0)return file.data;
+  if(file.method!==8||typeof DecompressionStream==='undefined')throw new Error('Browseren kan ikke åbne Word-skabelonen. Brug en opdateret Chrome eller Edge.');
+  return new Uint8Array(await new Response(new Blob([file.data]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).arrayBuffer());
+}
+async function createWordDocument(item){
+  const template=wordBase64(document.getElementById('dynamic-word-template').textContent.trim());if(!template.length)throw new Error('SOP_skabelon.docx mangler i eksporten. Eksportér planen igen.');
+  const files=wordTemplateFiles(template),documentPart=files.find(file=>file.name==='word/document.xml');if(!documentPart)throw new Error('SOP_skabelon.docx mangler word/document.xml.');
+  let source=wordDecoder.decode(await wordInflate(documentPart));
+  const values={'Elevnavn':item.elev,'Klasse':item.klasse,'Fag1 og niveau':item.fag1,'Vejleder fag 1':item.vejleder1,'Fag2 og niveau':item.fag2,'Vejleder fag 2':item.vejleder2};
+  for(const [placeholder,value] of Object.entries(values))source=source.split(placeholder).join(wordXml(value));
+  documentPart.data=wordEncoder.encode(source);documentPart.method=0;documentPart.flags=0;documentPart.crc=undefined;documentPart.size=documentPart.data.length;
+  return wordZip(files);
+}
+document.querySelectorAll('[data-dynamic-word-id]').forEach(link=>link.addEventListener('click',async event=>{
+  event.preventDefault();const item=dynamicWordValues[link.dataset.dynamicWordId];if(!item)return;const original=link.textContent;link.textContent='Opretter Word …';link.setAttribute('aria-busy','true');
+  try{const url=URL.createObjectURL(new Blob([await createWordDocument(item)],{type:'application/vnd.openxmlformats-officedocument.wordprocessingml.document'}));const download=document.createElement('a');download.href=url;download.download=item.filename;download.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}catch(error){alert(error.message||'Word-dokumentet kunne ikke oprettes.');}
+  finally{link.textContent=original;link.removeAttribute('aria-busy');}
+}));
+</script>"""
+    return script.replace("__WORD_VALUES__", payload).replace("__WORD_TEMPLATE__", template_payload)
 
 
 def _unplaced_section(schedule: dict[str, Any]) -> str:
@@ -1092,10 +1207,13 @@ def make_schedule_excel_beta(schedule: dict[str, Any]) -> bytes:
 
 def _teacher_html_with_actions(
     schedule: dict[str, Any], *, embedded_word: bool,
-    documents: dict[str, dict[str, Any]] | None = None,
+    documents: dict[str, dict[str, Any]] | None = None, progress_callback: Any = None,
+    dynamic_word: bool = False,
 ) -> str:
     document = _CORE_MAKE_SCHEDULE_HTML(schedule)
-    documents = documents if documents is not None else _word_documents(schedule)
+    documents = documents if documents is not None else (
+        {} if dynamic_word else _word_documents(schedule, progress_callback=progress_callback)
+    )
     document = document.replace(
         "<th>Bemærkning</th>",
         "<th>Bemærkning</th><th>Handlinger</th>",
@@ -1108,14 +1226,19 @@ def _teacher_html_with_actions(
         search_terms = core.normal_key(f"{row.get('Lærer', '')} {row.get('Initialer', '')}")
         cells = "".join(f"<td>{html.escape(str(row.get(column, '')))}</td>" for column in teacher_columns)
         old_row = f'<tr data-teacher="{html.escape(search_terms, quote=True)}">{cells}</tr>'
-        action = _action_html(schedule, str(row.get("Aktivitets-ID", "")), documents, embedded_word=embedded_word)
+        action = _action_html(
+            schedule, str(row.get("Aktivitets-ID", "")), documents,
+            embedded_word=embedded_word, dynamic_word=dynamic_word,
+        )
         new_row = f'<tr data-teacher="{html.escape(search_terms, quote=True)}">{cells}<td>{action}</td></tr>'
         document = document.replace(old_row, new_row, 1)
     action_style = """<style>
 .actions{display:flex;flex-wrap:wrap;gap:6px;min-width:225px}.action{display:inline-block;padding:6px 8px;border-radius:6px;font-size:12px;font-weight:700;text-decoration:none;white-space:nowrap}.action-word{background:#e7f4f1;color:#075f5b}.action-teams{background:#6264a7;color:#fff}.action-disabled{background:#eceff0;color:#899397;cursor:not-allowed}
 </style>"""
     document = document.replace("</head>", f"{action_style}</head>")
-    if embedded_word and documents:
+    if dynamic_word:
+        document = document.replace("</body>", f"{_dynamic_word_script(schedule)}</body>")
+    elif embedded_word and documents:
         payload = {
             activity_id: {
                 "filename": item["filename"],
@@ -1138,22 +1261,19 @@ document.querySelectorAll('[data-word-id]').forEach(link=>link.addEventListener(
     return _append_unplaced_html(lambda _: document, schedule)
 
 
-def make_schedule_html_beta(schedule: dict[str, Any]) -> str:
-    """Selvstændig lærer-HTML med indlejrede Word-downloads og Teams-links."""
-    return _teacher_html_with_actions(schedule, embedded_word=True)
+def make_schedule_html_beta(schedule: dict[str, Any], progress_callback: Any = None) -> str:
+    """Selvstændig lærer-HTML med Word-generering ved klik og Teams-links."""
+    return _teacher_html_with_actions(schedule, embedded_word=False, dynamic_word=True)
 
 
-def make_teacher_export_package(schedule: dict[str, Any]) -> bytes:
-    """Pak lærer-HTML og elevens Word-filer i én flytbar ZIP-fil."""
-    documents = _word_documents(schedule)
+def make_teacher_export_package(schedule: dict[str, Any], progress_callback: Any = None) -> bytes:
+    """Pak én lærer-HTML, som opretter det enkelte Word-dokument ved klik."""
     output = BytesIO()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
             "Vejledningsplan.html",
-            _teacher_html_with_actions(schedule, embedded_word=False, documents=documents).encode("utf-8"),
+            _teacher_html_with_actions(schedule, embedded_word=False, dynamic_word=True).encode("utf-8"),
         )
-        for document in documents.values():
-            archive.writestr(f"Word/{document['filename']}", document["content"])
     return output.getvalue()
 
 
@@ -1341,14 +1461,23 @@ def _render_beta_planner() -> None:
     package_key = f"{st.session_state.get('beta_context_marker', '')}:{schedule['beta']['version']}"
     if st.session_state.get("beta_teacher_package_key") != package_key:
         st.session_state["beta_teacher_package_key"] = package_key
-        st.session_state["beta_teacher_package"] = make_teacher_export_package(schedule)
-    st.download_button(
-        "Download lærer-HTML med Word-filer",
-        data=st.session_state["beta_teacher_package"],
-        file_name="Vejledningsplan-med-Word.zip",
-        mime="application/zip",
-        key="beta_download_teacher_package",
-    )
+        st.session_state["beta_teacher_package"] = None
+    package = st.session_state.get("beta_teacher_package")
+    if package is None and st.button(
+        "Klargør lærer-HTML med Word-links", type="primary", key="beta_prepare_teacher_package"
+    ):
+        progress = st.progress(0.2, text="Pakker lærer-HTML …")
+        package = make_teacher_export_package(schedule)
+        progress.progress(1.0, text="Lærer-HTML med Word-links er klar til download")
+        st.session_state["beta_teacher_package"] = package
+    if package is not None:
+        st.download_button(
+            "Download lærer-HTML med Word-links",
+            data=st.session_state["beta_teacher_package"],
+            file_name="Vejledningsplan-med-Word-links.zip",
+            mime="application/zip",
+            key="beta_download_teacher_package",
+        )
     changes = st.session_state.get("beta_change_log", [])
     if changes:
         with st.expander("Ændringslog", expanded=False):
