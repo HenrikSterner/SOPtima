@@ -29,14 +29,43 @@ import streamlit.components.v1 as components
 import app as core
 
 
-_CORE_MAKE_SCHEDULE = core.make_schedule
-_CORE_MAKE_SCHEDULE_EXCEL = core.make_schedule_excel
-_CORE_MAKE_SCHEDULE_HTML = core.make_schedule_html
-_CORE_MAKE_STUDENT_HTML = core.make_student_schedule_html
-_CORE_PARSE_STUDENTS = core.parse_students
-_CORE_PARSE_TEACHERS = core.parse_teachers
-_CORE_PARSE_SCHEDULE_UPLOAD = core.parse_schedule_upload
-_CORE_SCHEDULE_TEMPLATE = core.make_schedule_input_template
+def _original_core_function(name: str, beta_global_name: str) -> Any:
+    """Find den oprindelige core-funktion, også ved hot-reload af Streamlit."""
+    current = getattr(core, name)
+    # Hvis en ældre app_beta allerede har patched core, ligger dens gemte
+    # reference i beta-funktionens globals. Det gør opgradering uden manuel
+    # procesgenstart sikker.
+    candidate = getattr(current, "__globals__", {}).get(beta_global_name)
+    if callable(candidate) and candidate is not current:
+        return candidate
+    return current
+
+
+# Streamlit kan genkøre scriptet i samme Python-proces. Efter første kørsel er
+# ``core.make_schedule`` derfor allerede beta-wrapperen. Gem de oprindelige
+# funktioner på core-modulet, så en genkørsel aldrig bygger en beta-plan oven på
+# en tidligere beta-plan (hvilket bl.a. gav gentagne Aktivitets-ID/Status-
+# kolonner i Arrow-konverteringen).
+if not hasattr(core, "_SOPTIMA_BETA_ORIGINALS"):
+    core._SOPTIMA_BETA_ORIGINALS = {
+        "make_schedule": _original_core_function("make_schedule", "_CORE_MAKE_SCHEDULE"),
+        "make_schedule_excel": _original_core_function("make_schedule_excel", "_CORE_MAKE_SCHEDULE_EXCEL"),
+        "make_schedule_html": _original_core_function("make_schedule_html", "_CORE_MAKE_SCHEDULE_HTML"),
+        "make_student_schedule_html": _original_core_function("make_student_schedule_html", "_CORE_MAKE_STUDENT_HTML"),
+        "parse_students": _original_core_function("parse_students", "_CORE_PARSE_STUDENTS"),
+        "parse_teachers": _original_core_function("parse_teachers", "_CORE_PARSE_TEACHERS"),
+        "parse_schedule_upload": _original_core_function("parse_schedule_upload", "_CORE_PARSE_SCHEDULE_UPLOAD"),
+        "make_schedule_input_template": _original_core_function("make_schedule_input_template", "_CORE_SCHEDULE_TEMPLATE"),
+    }
+_CORE_ORIGINALS = core._SOPTIMA_BETA_ORIGINALS
+_CORE_MAKE_SCHEDULE = _CORE_ORIGINALS["make_schedule"]
+_CORE_MAKE_SCHEDULE_EXCEL = _CORE_ORIGINALS["make_schedule_excel"]
+_CORE_MAKE_SCHEDULE_HTML = _CORE_ORIGINALS["make_schedule_html"]
+_CORE_MAKE_STUDENT_HTML = _CORE_ORIGINALS["make_student_schedule_html"]
+_CORE_PARSE_STUDENTS = _CORE_ORIGINALS["parse_students"]
+_CORE_PARSE_TEACHERS = _CORE_ORIGINALS["parse_teachers"]
+_CORE_PARSE_SCHEDULE_UPLOAD = _CORE_ORIGINALS["parse_schedule_upload"]
+_CORE_SCHEDULE_TEMPLATE = _CORE_ORIGINALS["make_schedule_input_template"]
 
 KNOWN_TEACHER_EMAILS = {
     "hst": "hst@nextkbh.dk",
@@ -57,6 +86,31 @@ def _parse_clock(value: Any) -> datetime:
 
 def _clock(value: datetime) -> str:
     return value.strftime("%H:%M")
+
+
+def _unique_columns(columns: Any) -> list[Any]:
+    """Returnér kolonnerne i samme rækkefølge uden dubletter.
+
+    Pandas tillader dublerede labels, men Streamlit/pyarrow gør ikke. Det er
+    især vigtigt ved Streamlit-genkørsler, hvor en allerede beta-beriget
+    grundplan kan blive sendt ind igen.
+    """
+    result: list[Any] = []
+    seen: set[tuple[type, str]] = set()
+    for column in list(columns):
+        marker = (type(column), repr(column))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        result.append(column)
+    return result
+
+
+def _deduplicate_frame_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Fjern gentagne DataFrame-kolonner deterministisk (første vinder)."""
+    if frame.empty and not frame.columns.has_duplicates:
+        return frame
+    return frame.loc[:, ~frame.columns.duplicated(keep="first")].copy()
 
 
 _EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -237,7 +291,7 @@ def _activity_records(
     """Knyt den oprindelige elevrækkefølge til rækkerne i grundplanen."""
     teacher_map = {teacher["id"]: teacher for teacher in teachers}
     available: dict[tuple[str, ...], list[pd.Series]] = defaultdict(list)
-    for _, row in base["students"].iterrows():
+    for _, row in _deduplicate_frame_columns(base["students"]).iterrows():
         available[_row_key(row)].append(row)
 
     activities: list[dict[str, Any]] = []
@@ -464,16 +518,22 @@ def _build_beta_schedule(
             "Projekttitel": student.get("projectTitle", ""), "Varighed (min.)": student_minutes,
         })
 
-    student_columns = list(base["students"].columns) + ["Aktivitets-ID", "Status"]
-    teacher_columns = list(base["teachers"].columns) + ["Aktivitets-ID", "Status"]
-    timeline_columns = list(base["timeline"].columns) + ["Aktivitets-ID", "Status"]
+    # Grundplanen kan komme fra en tidligere Streamlit-genkørsel. Deduplikér
+    # både indgående og nye felter før DataFrame-oprettelse, ellers afviser
+    # pyarrow planen som ugyldig ved ``st.dataframe``.
+    base_students = _deduplicate_frame_columns(base["students"])
+    base_teachers = _deduplicate_frame_columns(base["teachers"])
+    base_timeline = _deduplicate_frame_columns(base["timeline"])
+    student_columns = _unique_columns(list(base_students.columns) + ["Aktivitets-ID", "Status"])
+    teacher_columns = _unique_columns(list(base_teachers.columns) + ["Aktivitets-ID", "Status"])
+    timeline_columns = _unique_columns(list(base_timeline.columns) + ["Aktivitets-ID", "Status"])
     unplaced_columns = [
         "Aktivitets-ID", "Status", "Årsag", "Elev", "Klasse", "Fag 1", "Vejleder 1",
         "Fag 2", "Vejleder 2", "Lærerpar", "Projekttitel", "Varighed (min.)",
     ]
-    student_frame = pd.DataFrame(student_rows, columns=student_columns).sort_values("Start", kind="stable")
-    teacher_frame = pd.DataFrame(teacher_rows, columns=teacher_columns).sort_values(["Start", "Lærer"], kind="stable")
-    timeline_frame = pd.DataFrame(timeline_rows, columns=timeline_columns).sort_values("Start", kind="stable")
+    student_frame = _deduplicate_frame_columns(pd.DataFrame(student_rows, columns=student_columns)).sort_values("Start", kind="stable")
+    teacher_frame = _deduplicate_frame_columns(pd.DataFrame(teacher_rows, columns=teacher_columns)).sort_values(["Start", "Lærer"], kind="stable")
+    timeline_frame = _deduplicate_frame_columns(pd.DataFrame(timeline_rows, columns=timeline_columns)).sort_values("Start", kind="stable")
     pair_rows = [
         {"Lærerpar": core._schedule_pair_label(pair, teacher_map), "Antal elever": count,
          "Tidsblok": " → ".join(pair_ranges[pair])}
@@ -534,7 +594,7 @@ def _build_beta_schedule(
         "students": student_frame.reset_index(drop=True),
         "teachers": teacher_frame.reset_index(drop=True),
         "timeline": timeline_frame.reset_index(drop=True),
-        "pairs": pd.DataFrame(pair_rows, columns=list(base["pairs"].columns)),
+        "pairs": _deduplicate_frame_columns(pd.DataFrame(pair_rows, columns=_unique_columns(base["pairs"].columns))),
         "settings": settings,
         "unplaced": pd.DataFrame(unplaced_rows, columns=unplaced_columns),
         "activities": pd.DataFrame(activity_rows),

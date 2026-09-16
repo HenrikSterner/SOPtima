@@ -126,6 +126,41 @@ def test_partial_schedule_returns_planned_and_unplaced_instead_of_error():
     assert_no_teacher_conflicts(schedule)
 
 
+def test_beta_deduplicates_columns_from_a_previous_streamlit_rerun(monkeypatch):
+    students = [student(1)]
+    teachers = [teacher("a", "A"), teacher("b", "B")]
+    solution = {"assignments": [["a", "b"]]}
+    original_make_schedule = beta._CORE_MAKE_SCHEDULE
+    def compatible_base(*args, **kwargs):
+        kwargs["lunch_mode"] = "Fast tidspunkt for alle l" + chr(230) + "rere"
+        return original_make_schedule(*args, **kwargs)
+    monkeypatch.setattr(beta, "_CORE_MAKE_SCHEDULE", compatible_base)
+    original_beta_schedule = beta.make_schedule_beta
+    def compatible_beta(*args, **kwargs):
+        kwargs["lunch_mode"] = "Fast tidspunkt for alle l" + chr(230) + "rere"
+        return original_beta_schedule(*args, **kwargs)
+    monkeypatch.setattr(beta, "make_schedule_beta", compatible_beta)
+    base = beta._CORE_MAKE_SCHEDULE(
+        students, teachers, solution, clock(8), clock(12), 20, 0, 0, 0, True,
+        lunch_mode="Fast tidspunkt for alle lÃ¦rere", lunch_start_time=clock(10),
+        lunch_minutes=5, search_attempts=2,
+    )
+    # Efter en script-genkørsel kunne en gammel beta-plan tidligere blive brugt
+    # som grundplan og få de samme kolonner tilføjet igen.
+    base["students"] = pd.concat([base["students"], base["students"]], axis=1)
+    base["teachers"] = pd.concat([base["teachers"], base["teachers"]], axis=1)
+    base["timeline"] = pd.concat([base["timeline"], base["timeline"]], axis=1)
+    monkeypatch.setattr(beta, "_CORE_MAKE_SCHEDULE", lambda *args, **kwargs: base)
+    schedule = beta.make_schedule_beta(
+        students, teachers, solution, clock(8), clock(12), 20, 0, 0, 0, True,
+        lunch_mode="Fast tidspunkt for alle lÃ¦rere", lunch_start_time=clock(10),
+        lunch_minutes=5, search_attempts=2,
+    )
+    assert schedule["students"].columns.is_unique
+    assert schedule["teachers"].columns.is_unique
+    assert schedule["timeline"].columns.is_unique
+
+
 def test_activity_schema_and_ids_are_stable_when_input_order_changes():
     students = [student(1), student(2), student(3)]
     teachers = [teacher("a", "A"), teacher("b", "B")]

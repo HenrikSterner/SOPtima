@@ -1761,7 +1761,7 @@ table{{border-collapse:collapse;width:100%;min-width:760px}} th,td{{padding:9px 
 </style></head>
 <body><main>
 <section class="intro"><h1>Vejledningsplan</h1><p>Detaljeret tidsplan for elever og lærere baseret på den beregnede SOP-fordeling. Fordelingen er foretaget ud fra SOPtima – en algoritme udviklet af Henrik (hst@nextkhb.dk). Stadig i beta, så skriv gerne, hvis der er mangler eller fejl.</p><ul>{setting_lines}</ul></section>
-<section class="card"><h2>Vejledningsplan for lærere</h2><label for="teacher-query">Søg på lærerens navn eller initialer</label><input class="teacher-search" id="teacher-query" type="search" autocomplete="off" placeholder="Fx Anne eller AB"><p id="teacher-prompt">Skriv lærerens navn eller initialer for at se den specifikke plan.</p>{gantt_html}
+<section class="card"><h2>Vejledningsplan for lærere</h2><label for="teacher-query">Søg på lærerens navn eller initialer</label><input class="teacher-search" id="teacher-query" type="search" autocomplete="off" placeholder="Fx Anne eller AB"><p id="teacher-prompt">Du kan trykke på lærerens navn eller søge efter navn eller initialer. Når læreren er valgt, vises den specifikke plan, og Word-skabelonen kan genereres i højre side.</p>{gantt_html}
 <section class="teacher-agenda" id="teacher-agenda" hidden><h3>Elever med vejledning hos den valgte lærer</h3><div class="table-wrap"><table><thead><tr>{teacher_headers}</tr></thead><tbody id="teacher-agenda-rows">{''.join(teacher_agenda_rows)}</tbody></table></div><p id="teacher-empty" hidden>Ingen lærer matcher søgningen.</p></section></section>
 <div id="student-data" hidden aria-hidden="true">{schedule["students"].to_html(index=False, escape=True, border=0)}</div>
 <footer class="copyright">{html.escape(COPYRIGHT)}</footer>
