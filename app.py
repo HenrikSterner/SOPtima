@@ -904,10 +904,32 @@ def _round_order_metrics(
     return gap_rounds, pair_affinity
 
 
+def _pair_gap_rounds(
+    round_order: list[int],
+    round_pairs: list[set[tuple[str, ...]]],
+) -> int:
+    """Tæl tomme runder inde i hvert lærerpars vejledningsblok.
+
+    En score på nul betyder, at alle vejledninger for hvert par ligger i én
+    ubrudt række af runder. Det er et mere direkte mål end blot at belønne
+    to ens par i naborunder, fordi selve hullerne dermed bliver optimeret.
+    """
+    positions_by_pair: dict[tuple[str, ...], list[int]] = defaultdict(list)
+    for position, round_number in enumerate(round_order):
+        for pair in round_pairs[round_number]:
+            positions_by_pair[pair].append(position)
+    return sum(
+        positions[-1] - positions[0] + 1 - len(positions)
+        for positions in positions_by_pair.values()
+        if len(positions) > 1
+    )
+
+
 def _optimise_teacher_round_order(
     round_teachers: list[set[str]],
     initial_order: list[int],
     round_pairs: list[set[tuple[str, ...]]] | None = None,
+    prioritise_pairs: bool = False,
 ) -> list[int]:
     """Forsøg at samle hver lærers runder ved at optimere rækkefølgen af runder.
 
@@ -918,9 +940,12 @@ def _optimise_teacher_round_order(
     if len(initial_order) < 2:
         return initial_order[:]
 
-    def score(order: list[int]) -> tuple[int, int]:
+    def score(order: list[int]) -> tuple[int, int, int]:
         gaps, affinity = _round_order_metrics(order, round_teachers, round_pairs)
-        return gaps, -affinity
+        pair_gaps = _pair_gap_rounds(order, round_pairs) if round_pairs is not None else 0
+        if prioritise_pairs and round_pairs is not None:
+            return pair_gaps, gaps, -affinity
+        return gaps, pair_gaps, -affinity
 
     def greedy_order(start: int) -> list[int]:
         remaining = set(initial_order)
@@ -969,11 +994,26 @@ def _optimise_teacher_round_order(
             improved = False
             for source in range(len(best_order)):
                 for target in range(len(best_order)):
-                    if source == target or abs(source - target) < 2:
+                    if source == target:
                         continue
                     candidate = best_order[:]
                     moved = candidate.pop(source)
                     candidate.insert(target, moved)
+                    candidate_score = score(candidate)
+                    if candidate_score < best_score:
+                        best_order, best_score = candidate, candidate_score
+                        improved = True
+                        break
+                if improved:
+                    break
+            if improved:
+                continue
+            # En direkte ombytning kan slippe ud af lokale minima, hvor ingen
+            # enkelt flytning forbedrer lærerparrenes blokke.
+            for left in range(len(best_order) - 1):
+                for right in range(left + 1, len(best_order)):
+                    candidate = best_order[:]
+                    candidate[left], candidate[right] = candidate[right], candidate[left]
                     candidate_score = score(candidate)
                     if candidate_score < best_score:
                         best_order, best_score = candidate, candidate_score
@@ -1149,8 +1189,8 @@ def make_schedule(
     lower_bound = max(len(session_indexes) for session_indexes in teacher_sessions.values())
     best_colors: list[int] | None = None
     best_colour_count = len(ordered_sessions) + 1
-    best_gap_score: int | None = None
     best_round_order: list[int] | None = None
+    best_quality: tuple[int, int, int] | None = None
     coloring_attempts = max(1, search_attempts)
     for attempt_index in range(coloring_attempts):
         rng = __import__("random").Random(20260913 + attempt_index)
@@ -1174,8 +1214,8 @@ def make_schedule(
                     saturation[other].add(colour)
         colour_count = max(colors) + 1
         candidate_round_order = list(range(colour_count))
-        candidate_gap_score = None
-        if avoid_teacher_gaps:
+        candidate_gap_score = (0, 0)
+        if avoid_teacher_gaps or group_pairs:
             candidate_round_teachers = [set() for _ in range(colour_count)]
             candidate_round_pairs = [set() for _ in range(colour_count)]
             for session, colour in zip(ordered_sessions, colors):
@@ -1185,77 +1225,58 @@ def make_schedule(
                 candidate_round_teachers,
                 candidate_round_order,
                 candidate_round_pairs if group_pairs else None,
+                prioritise_pairs=group_pairs,
             )
-            candidate_gap_score, _ = _round_order_metrics(
+            teacher_gaps, _ = _round_order_metrics(
                 candidate_round_order,
                 candidate_round_teachers,
                 candidate_round_pairs if group_pairs else None,
             )
+            pair_gaps = (
+                _pair_gap_rounds(candidate_round_order, candidate_round_pairs)
+                if group_pairs
+                else 0
+            )
+            # Når begge hensyn er valgt, er en ubrudt blok for hvert
+            # lærerpar det primære mål. Lærerhuller afgør derefter mellem
+            # planer med lige god samling af parrene.
+            candidate_gap_score = (pair_gaps, teacher_gaps)
 
-        is_better = colour_count < best_colour_count
-        if avoid_teacher_gaps and colour_count == best_colour_count:
-            is_better = best_gap_score is None or candidate_gap_score < best_gap_score
+        if group_pairs:
+            # En sammenhængende række for parrene vejer tungere end at spare
+            # en parallel runde. Derefter foretrækkes den korteste plan og,
+            # hvis valgt, færrest individuelle lærerhuller.
+            candidate_quality = (
+                candidate_gap_score[0],
+                colour_count,
+                candidate_gap_score[1] if avoid_teacher_gaps else 0,
+            )
+        elif avoid_teacher_gaps:
+            candidate_quality = (colour_count, candidate_gap_score[1], 0)
+        else:
+            candidate_quality = (colour_count, 0, 0)
+        is_better = best_quality is None or candidate_quality < best_quality
         if is_better:
             best_colors = colors
             best_colour_count = colour_count
-            best_gap_score = candidate_gap_score
             best_round_order = candidate_round_order
+            best_quality = candidate_quality
         if progress_callback:
             progress_callback(0.1 + 0.8 * (attempt_index + 1) / coloring_attempts)
-        if not avoid_teacher_gaps and best_colour_count <= lower_bound:
+        if not avoid_teacher_gaps and not group_pairs and best_colour_count <= lower_bound:
             break
 
     # En ombytning af hele runder ændrer ikke lærer-konflikterne. Når
-    # lærerpar-optimering er valgt, bruges det derfor som et sekundært mål:
+    # lærerpar-optimering er valgt, bruges den som det primære mål:
     # runder med de samme lærerpar placeres så vidt muligt ved siden af
     # hinanden, uden at antallet af runder eller paralleliteten ændres.
     round_order = best_round_order or list(range(best_colour_count))
-    if not avoid_teacher_gaps and group_pairs and best_colors is not None and best_colour_count > 1:
-        pairs_in_round = [set() for _ in range(best_colour_count)]
-        for session, colour in zip(ordered_sessions, best_colors):
-            pairs_in_round[colour].add(session["pair"])
-        affinity = [
-            [len(pairs_in_round[left] & pairs_in_round[right]) for right in range(best_colour_count)]
-            for left in range(best_colour_count)
-        ]
-
-        def order_score(order: list[int]) -> int:
-            return sum(affinity[left][right] for left, right in zip(order, order[1:]))
-
-        best_order = round_order
-        best_order_score = -1
-        for start in round_order:
-            candidate_order = [start]
-            remaining = set(round_order)
-            remaining.remove(start)
-            while remaining:
-                previous = candidate_order[-1]
-                best_affinity = max(affinity[previous][candidate] for candidate in remaining)
-                next_round = min(candidate for candidate in remaining if affinity[previous][candidate] == best_affinity)
-                candidate_order.append(next_round)
-                remaining.remove(next_round)
-            candidate_score = order_score(candidate_order)
-            if candidate_score > best_order_score:
-                best_order = candidate_order
-                best_order_score = candidate_score
-        improved = True
-        while improved:
-            improved = False
-            for left in range(len(best_order) - 1):
-                for right in range(left + 1, len(best_order)):
-                    candidate_order = best_order[:]
-                    candidate_order[left], candidate_order[right] = candidate_order[right], candidate_order[left]
-                    if order_score(candidate_order) > best_order_score:
-                        best_order = candidate_order
-                        best_order_score = order_score(candidate_order)
-                        improved = True
-        round_order = best_order
 
     # Rækkefølgen af de farvede runder kan ændres uden at skabe en
     # dobbeltbooking. Når der er lærerspærringer, vælger vi derfor først de
     # runder, der faktisk kan begynde nu. Det forhindrer, at en spærring for
     # én lærer unødigt forsinker helt uafhængige lærerpar.
-    if any(blocked_intervals.values()) and best_colors is not None:
+    if any(blocked_intervals.values()) and best_colors is not None and not group_pairs:
         teachers_in_colour = [set() for _ in range(best_colour_count)]
         for session, colour in zip(ordered_sessions, best_colors):
             teachers_in_colour[colour].update(session["pair"])
@@ -1293,9 +1314,12 @@ def make_schedule(
         session["round"] = colour_to_round[colour]
     last_round = max(session["round"] for session in ordered_sessions)
     final_round_teachers = [set() for _ in range(last_round + 1)]
+    final_round_pairs = [set() for _ in range(last_round + 1)]
     for session in ordered_sessions:
         final_round_teachers[session["round"]].update(session["pair"])
+        final_round_pairs[session["round"]].add(session["pair"])
     teacher_gap_rounds, _ = _round_order_metrics(list(range(last_round + 1)), final_round_teachers)
+    pair_gap_rounds = _pair_gap_rounds(list(range(last_round + 1)), final_round_pairs)
     floating_lunch_round = max(1, (last_round + 1) // 2)
     if lunch_mode == "Fast tidspunkt for alle lærere":
         lunch_reference = datetime.combine(date.today(), lunch_start_time)
@@ -1600,6 +1624,7 @@ def make_schedule(
             "Frokostpause": lunch_mode,
             "Fast frokosttid": _clock_label(lunch_start_dt) if lunch_mode == "Fast tidspunkt for alle lærere" else "Flydende",
             "Lærerpar samlet": "Ja" if group_pairs else "Nej",
+            "Lærerparhuller (runder)": pair_gap_rounds,
             "Lærerspærringer": sum(len(intervals) for intervals in blocked_intervals.values()),
             "Forsøg at undgå lærerhuller": "Ja" if avoid_teacher_gaps else "Nej",
             "Lærerhuller (runder)": teacher_gap_rounds,

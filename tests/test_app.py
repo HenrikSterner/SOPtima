@@ -109,6 +109,17 @@ def guidance_round_count(schedule: dict) -> int:
     return frame[["Start", "Slut"]].drop_duplicates().shape[0]
 
 
+def pair_gap_rounds(schedule: dict) -> int:
+    frame = schedule["students"].sort_values(["Start", "Lærerpar"], kind="stable")
+    rounds = {start: index for index, start in enumerate(sorted(frame["Start"].unique()))}
+    gaps = 0
+    for _, rows in frame.groupby("Lærerpar"):
+        positions = sorted(rounds[start] for start in rows["Start"])
+        if len(positions) > 1:
+            gaps += positions[-1] - positions[0] + 1 - len(positions)
+    return gaps
+
+
 def assert_solution_invariants(students, teachers, capacities, solution):
     assessment = app.assignment_assessment(
         students,
@@ -384,6 +395,22 @@ def test_grouping_pairs_preserves_conflict_rules_and_round_count():
     guidance = grouped["teachers"][grouped["teachers"]["Type"] == "Vejledning"]
     for _, rows in guidance.groupby("Initialer"):
         assert not rows.duplicated(subset=["Start", "Slut"]).any()
+
+
+def test_grouping_pairs_stays_primary_when_teacher_gaps_are_also_optimised():
+    pairs = [
+        ("a", "b"), ("c", "d"), ("a", "b"), ("a", "e"),
+        ("c", "d"), ("f", "g"), ("f", "g"),
+    ]
+    schedule = schedule_for_pairs(
+        pairs,
+        group_pairs=True,
+        attempts=40,
+        avoid_teacher_gaps=True,
+    )
+
+    assert pair_gap_rounds(schedule) == 0
+    assert schedule["settings"]["Lærerparhuller (runder)"] == 0
 
 
 def test_teacher_gap_optimisation_collects_rounds_without_changing_round_count():

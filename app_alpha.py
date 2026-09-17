@@ -123,6 +123,15 @@ def normalise_teams_email(value: Any) -> str:
     return email if _EMAIL_PATTERN.fullmatch(email) else ""
 
 
+def _first_valid_teams_email(*values: Any) -> str:
+    """Returnér den første reelt gyldige adresse blandt mulige kilder."""
+    for value in values:
+        email = normalise_teams_email(value)
+        if email:
+            return email
+    return ""
+
+
 def default_teacher_teams_email(teacher_id: Any) -> str:
     """Brug skolens almindelige initiale-adresse, når den er sikker at udlede."""
     identifier = core.normal_key(teacher_id)
@@ -453,9 +462,12 @@ def _build_beta_schedule(
         requested = None
         if activity["id"] in locked_activities:
             requested = _parse_clock(locked_activities[activity["id"]])
-        # Kun manuelt låste flytninger har en fast ønsket tid. Alle øvrige
-        # aktiviteter finder det tidligst mulige lovlige tidspunkt.
-        preferred = requested
+        # Bevar grundplanens optimerede rækkefølge for alle ulåste
+        # aktiviteter. Hvis de i stedet altid flyttes til dagens første ledige
+        # felt, kan Alpha-opbygningen opløse de sammenhængende lærerpar, som
+        # kerneplanen netop har samlet. Kun ved en reel konflikt søges der efter
+        # et alternativt tidspunkt.
+        preferred = requested if requested is not None else activity["base_start"]
         slot = _find_first_slot(
             activity, student_minutes, plan_start, plan_end, placed, breaks, teacher_blocks,
             transition_minutes, preferred,
@@ -630,13 +642,16 @@ def _build_beta_schedule(
         })
         metadata[activity_id] = {
             "student": student,
-            "student_email": normalise_teams_email(student.get("teams_email") or student.get("email")),
+            "student_email": _first_valid_teams_email(
+                student.get("teams_email"), student.get("email"), student.get("Email")
+            ),
             "teacher_ids": list(activity["assigned"]),
             "teacher_emails": [
-                normalise_teams_email(
-                    teacher_map.get(teacher_id, {}).get("teams_email")
-                    or teacher_map.get(teacher_id, {}).get("email")
-                    or default_teacher_teams_email(teacher_id)
+                _first_valid_teams_email(
+                    teacher_map.get(teacher_id, {}).get("teams_email"),
+                    teacher_map.get(teacher_id, {}).get("email"),
+                    teacher_map.get(teacher_id, {}).get("Email"),
+                    default_teacher_teams_email(teacher_id),
                 )
                 for teacher_id in activity["assigned"]
             ],
@@ -970,14 +985,18 @@ def teams_chat_link(schedule: dict[str, Any], activity_id: str) -> tuple[str, st
     if not metadata or matches.empty or not core.repair_text(matches.iloc[0].get("start")):
         return "", "Aktiviteten har ikke et bekræftet tidspunkt."
     missing = []
-    student_email = normalise_teams_email(metadata.get("student_email"))
+    student = metadata.get("student") if isinstance(metadata.get("student"), dict) else {}
+    student_email = _first_valid_teams_email(
+        metadata.get("student_email"), student.get("teams_email"),
+        student.get("email"), student.get("Email"),
+    )
     if not student_email:
         missing.append(metadata.get("student_name") or "eleven")
     teacher_emails = []
     for teacher_id, teacher_name, email in zip(
         metadata.get("teacher_ids", []), metadata.get("teacher_names", []), metadata.get("teacher_emails", [])
     ):
-        valid = normalise_teams_email(email)
+        valid = _first_valid_teams_email(email, default_teacher_teams_email(teacher_id))
         if not valid:
             missing.append(teacher_name or teacher_id)
         else:

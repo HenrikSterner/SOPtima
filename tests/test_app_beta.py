@@ -16,6 +16,7 @@ from openpyxl import load_workbook
 from streamlit.testing.v1 import AppTest
 
 import app
+import app_alpha as alpha
 import app_beta as beta
 
 
@@ -106,6 +107,50 @@ def make_beta_schedule(
 def minutes(value: str) -> int:
     parsed = datetime.strptime(value, "%H:%M")
     return parsed.hour * 60 + parsed.minute
+
+
+def test_alpha_preserves_core_pair_blocks_when_rebuilding_schedule():
+    pairs = [("a", "b"), ("c", "d"), ("a", "b"), ("a", "e"), ("c", "d"), ("f", "g"), ("f", "g")]
+    ids = sorted({teacher_id for pair in pairs for teacher_id in pair})
+    teachers = [teacher(teacher_id, teacher_id.upper()) for teacher_id in ids]
+    students = [student(index + 1) for index in range(len(pairs))]
+    schedule = alpha.make_schedule_beta(
+        students, teachers, {"assignments": [list(pair) for pair in pairs]},
+        clock(8), clock(12), 20, 0, 0, 0, True,
+        lunch_mode="Fast tidspunkt for alle lærere", lunch_start_time=clock(10),
+        lunch_minutes=5, search_attempts=40, avoid_teacher_gaps=True,
+    )
+
+    frame = schedule["students"]
+    round_by_start = {start: index for index, start in enumerate(sorted(frame["Start"].unique()))}
+    for _, rows in frame.groupby("Lærerpar"):
+        positions = sorted(round_by_start[start] for start in rows["Start"])
+        assert not positions or positions == list(range(positions[0], positions[-1] + 1))
+
+
+def test_alpha_teams_link_uses_student_email_column_and_teacher_initials():
+    pupil = student(1, email="")
+    pupil["Email"] = "NEXT27888@EDU.NEXTKBH.DK"
+    pupil["teams_email"] = "ikke-en-email"
+    teachers = [teacher("hst", "Henrik", ""), teacher("matr", "Mathias", "")]
+    teachers[0]["teams_email"] = "ugyldig"
+    schedule = alpha.make_schedule_beta(
+        [pupil], teachers, {"assignments": [["hst", "matr"]]},
+        clock(8), clock(12), 20, 0, 0, 0, True,
+        lunch_mode="Fast tidspunkt for alle lærere", lunch_start_time=clock(10),
+        lunch_minutes=5, search_attempts=5,
+    )
+
+    activity_id = schedule["activities"].iloc[0]["activity_id"]
+    link, error = alpha.teams_chat_link(schedule, activity_id)
+    assert not error
+    assert "hst%40nextkbh.dk" in link
+    assert "matr%40nextkbh.dk" in link
+    assert "next27888%40edu.nextkbh.dk" in link
+    assert "users=hst%40nextkbh.dk,matr%40nextkbh.dk,next27888%40edu.nextkbh.dk" in link
+    teacher_html = alpha.make_schedule_html_beta(schedule)
+    assert f'href="{link.replace("&", "&amp;")}"' in teacher_html
+    assert teacher_html.count('class="action action-teams"') == 2
 
 
 def dynamic_word_bytes(teacher_html: str) -> bytes:
