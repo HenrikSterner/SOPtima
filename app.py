@@ -48,6 +48,19 @@ def normal_key(value: Any) -> str:
     return re.sub(r"\s+", " ", repair_text(value)).strip().casefold()
 
 
+def sop_class_label(value: Any, today: date | None = None) -> str:
+    """Vis fx den administrative klasse ``S 2024y`` som ``3.y`` i SOP."""
+    original = repair_text(value)
+    compact = re.sub(r"\s+", "", original).casefold()
+    match = re.fullmatch(r"s(20\d{2})([a-z])", compact)
+    if not match:
+        return original
+    reference = today or date.today()
+    school_year_start = reference.year if reference.month >= 8 else reference.year - 1
+    grade = school_year_start - int(match.group(1)) + 1
+    return f"{grade}.{match.group(2)}" if grade > 0 else original
+
+
 def canonical_subject(value: Any) -> str:
     subject = normal_key(value)
     subject = re.sub(r"\s+[abc]\*?$", "", subject)
@@ -1836,26 +1849,48 @@ query.addEventListener('input',filter); query.focus();
 
 
 def replace_docx_placeholders(template: bytes, values: dict[str, str]) -> bytes:
-    from docx import Document
-    source = io.BytesIO(template)
-    document = Document(source)
-    paragraphs = list(document.paragraphs)
-    for table in document.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                paragraphs.extend(cell.paragraphs)
-    for paragraph in paragraphs:
-        full = "".join(run.text for run in paragraph.runs)
-        for placeholder, replacement in values.items():
-            if placeholder in full:
-                full = full.replace(placeholder, replacement)
-        if paragraph.runs:
-            paragraph.runs[0].text = full
-            for run in paragraph.runs[1:]:
-                run.text = ""
-    result = io.BytesIO()
-    document.save(result)
-    return result.getvalue()
+    """Erstat præcise ``<Felt>``-markører uden at beholde markeringstegnene."""
+    placeholders = [
+        (f"<{repair_text(field).strip().strip('<>')}>", repair_text(value))
+        for field, value in values.items()
+    ]
+    paragraph_pattern = re.compile(r"<w:p(?:\s[^>]*)?>[\s\S]*?</w:p>")
+    text_pattern = re.compile(r"(<w:t(?:\s[^>]*)?>)([\s\S]*?)(</w:t>)")
+
+    def replace_in_paragraph(match: re.Match[str]) -> str:
+        paragraph = match.group(0)
+        nodes = list(text_pattern.finditer(paragraph))
+        if not nodes:
+            return paragraph
+        original = "".join(html.unescape(node.group(2)) for node in nodes)
+        replaced = original
+        for placeholder, replacement in placeholders:
+            replaced = replaced.replace(placeholder, replacement)
+        if replaced == original:
+            return paragraph
+        first = True
+
+        def rewrite_text(node: re.Match[str]) -> str:
+            nonlocal first
+            content = html.escape(replaced, quote=False) if first else ""
+            first = False
+            return f"{node.group(1)}{content}{node.group(3)}"
+
+        return text_pattern.sub(rewrite_text, paragraph)
+
+    # Pladsholderne kan være fordelt over flere Word-runs og ligge i
+    # tekstbokse. Derfor behandles OOXML-afsnittene direkte.
+    output = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(template)) as source_archive:
+        with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as target_archive:
+            for info in source_archive.infolist():
+                content = source_archive.read(info.filename)
+                if info.filename.endswith(".xml"):
+                    text = content.decode("utf-8")
+                    text = paragraph_pattern.sub(replace_in_paragraph, text)
+                    content = text.encode("utf-8")
+                target_archive.writestr(info, content)
+    return output.getvalue()
 
 
 def make_docx_zip(students: list[dict[str, Any]], teachers: list[dict[str, Any]], solution: dict[str, Any]) -> bytes:
@@ -1864,7 +1899,7 @@ def make_docx_zip(students: list[dict[str, Any]], teachers: list[dict[str, Any]]
     with zipfile.ZipFile(files, "w", zipfile.ZIP_DEFLATED) as archive:
         for index, student in enumerate(students):
             assigned = solution["assignments"][index]
-            values = {"Elevnavn": student["name"], "Klasse": student.get("className", ""), "Fag1 og niveau": student["subjects"][0], "Vejleder fag 1": teacher_label(assigned[0], teacher_map), "Fag2 og niveau": student["subjects"][1], "Vejleder fag 2": teacher_label(assigned[1], teacher_map)}
+            values = {"Elevnavn": student["name"], "Klasse": sop_class_label(student.get("className", "")), "Fag1 og niveau": student["subjects"][0], "Vejleder fag 1": teacher_label(assigned[0], teacher_map), "Fag2 og niveau": student["subjects"][1], "Vejleder fag 2": teacher_label(assigned[1], teacher_map)}
             try:
                 if not DEFAULT_TEMPLATE.exists():
                     raise OSError("Word-skabelonen findes ikke")
@@ -1874,14 +1909,19 @@ def make_docx_zip(students: list[dict[str, Any]], teachers: list[dict[str, Any]]
                 from docx import Document
                 document = Document()
                 document.add_heading(f"SOP – {student['name']}", 0)
-                document.add_paragraph(f"Klasse: {student.get('className', '')}")
+                document.add_paragraph(f"Klasse: {values['Klasse']}")
                 document.add_paragraph(f"{student['subjects'][0]}: {teacher_label(assigned[0], teacher_map)}")
                 document.add_paragraph(f"{student['subjects'][1]}: {teacher_label(assigned[1], teacher_map)}")
                 output = io.BytesIO(); document.save(output); content = output.getvalue()
             try:
                 from docx import Document
                 completed = Document(io.BytesIO(content))
-                all_text = "\n".join(paragraph.text for paragraph in completed.paragraphs)
+                with zipfile.ZipFile(io.BytesIO(content)) as completed_archive:
+                    all_text = "\n".join(
+                        html.unescape(re.sub(r"<[^>]+>", "", completed_archive.read(name).decode("utf-8")))
+                        for name in completed_archive.namelist()
+                        if name.startswith("word/") and name.endswith(".xml")
+                    )
                 if student["name"] not in all_text:
                     summary_lines = [
                         f"Elev: {student['name']}",

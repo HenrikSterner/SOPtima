@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import io
 import base64
+import html
 import re
 import shutil
 import subprocess
 import zipfile
-from datetime import datetime, time as clock
+from datetime import date, datetime, time as clock
 
 import pandas as pd
 import pytest
@@ -105,6 +106,28 @@ def make_beta_schedule(
 def minutes(value: str) -> int:
     parsed = datetime.strptime(value, "%H:%M")
     return parsed.hour * 60 + parsed.minute
+
+
+def dynamic_word_bytes(teacher_html: str) -> bytes:
+    """Kør den indlejrede browser-generator i Node.js til eksporttest."""
+    node_script = r"""
+const input=await new Promise(resolve=>{let value='';process.stdin.setEncoding('utf8');process.stdin.on('data',part=>value+=part);process.stdin.on('end',()=>resolve(value));});
+const scripts=[...input.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)].map(match=>match[1]);
+const values=input.match(/<script id="dynamic-word-values" type="application\/json">([\s\S]*?)<\/script>/)?.[1];
+const template=input.match(/<script id="dynamic-word-template" type="text\/plain">([\s\S]*?)<\/script>/)?.[1];
+const generator=scripts.find(script=>script.includes('function wordTemplateFiles'));
+if(!values||!template||!generator)throw new Error('Mangler indlejret Word-generator');
+global.document={getElementById:id=>({textContent:id==='dynamic-word-values'?values:template}),querySelectorAll:()=>[]};
+const item=Object.values(JSON.parse(values))[0];
+const bytes=await eval(`(async()=>{${generator};return await createWordDocument(${JSON.stringify(item)});})()`);
+process.stdout.write(Buffer.from(bytes).toString('base64'));
+"""
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", node_script], input=teacher_html,
+        text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return base64.b64decode(result.stdout)
 
 
 def assert_no_teacher_conflicts(schedule: dict) -> None:
@@ -289,8 +312,8 @@ def test_teams_link_contains_student_and_both_teacher_addresses():
 
 def test_missing_teams_email_disables_action_with_explanation():
     students = [student(1, email="")]
-    teachers = [teacher("a", "A", "a@nextkbh.dk"), teacher("b", "B", "")]
-    schedule, _ = make_beta_schedule([("a", "b")], students_override=students, teachers_override=teachers)
+    teachers = [teacher("a1", "A", "a1@nextkbh.dk"), teacher("longteacher", "B", "")]
+    schedule, _ = make_beta_schedule([("a1", "longteacher")], students_override=students, teachers_override=teachers)
     activity_id = schedule["activities"].iloc[0]["activity_id"]
     link, error = beta.teams_chat_link(schedule, activity_id)
     assert link == ""
@@ -298,6 +321,18 @@ def test_missing_teams_email_disables_action_with_explanation():
     teacher_html = beta.make_schedule_html_beta(schedule)
     assert "action-disabled" in teacher_html
     assert "mangler Teams-adresse" in teacher_html
+
+
+def test_standard_teacher_initials_get_a_teams_address_and_render_a_real_link():
+    students = [student(1, email="next27888@edu.nextkbh.dk")]
+    teachers = [teacher("bok", "Bo", ""), teacher("polk", "Poul", "")]
+    schedule, _ = make_beta_schedule([("bok", "polk")], students_override=students, teachers_override=teachers)
+    activity_id = schedule["activities"].iloc[0]["activity_id"]
+    link, error = beta.teams_chat_link(schedule, activity_id)
+    assert not error
+    assert "bok%40nextkbh.dk" in link and "polk%40nextkbh.dk" in link
+    teacher_html = beta.make_schedule_html_beta(schedule)
+    assert f'href="{link.replace("&", "&amp;")}"' in teacher_html
 
 
 def test_teacher_html_has_word_and_teams_actions_but_unplaced_has_none():
@@ -343,36 +378,60 @@ def test_teacher_export_package_contains_only_html_with_dynamic_unique_word_down
 def test_dynamic_word_download_uses_template_and_replaces_all_schedule_fields():
     schedule, _ = make_beta_schedule([("a", "b")])
     teacher_html = beta.make_schedule_html_beta(schedule)
-    node_script = r"""
-const input=await new Promise(resolve=>{let value='';process.stdin.setEncoding('utf8');process.stdin.on('data',part=>value+=part);process.stdin.on('end',()=>resolve(value));});
-const scripts=[...input.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)].map(match=>match[1]);
-const values=input.match(/<script id="dynamic-word-values" type="application\/json">([\s\S]*?)<\/script>/)?.[1];
-const template=input.match(/<script id="dynamic-word-template" type="text\/plain">([\s\S]*?)<\/script>/)?.[1];
-const generator=scripts.find(script=>script.includes('function wordTemplateFiles'));
-if(!values||!template||!generator)throw new Error('Mangler indlejret Word-generator');
-global.document={getElementById:id=>({textContent:id==='dynamic-word-values'?values:template}),querySelectorAll:()=>[]};
-const item=Object.values(JSON.parse(values))[0];
-const bytes=await eval(`(async()=>{${generator};return await createWordDocument(${JSON.stringify(item)});})()`);
-process.stdout.write(Buffer.from(bytes).toString('base64'));
-"""
-    result = subprocess.run(
-        ["node", "--input-type=module", "-e", node_script], input=teacher_html,
-        text=True, capture_output=True, check=False,
-    )
-    assert result.returncode == 0, result.stderr
-    word_bytes = base64.b64decode(result.stdout)
+    word_bytes = dynamic_word_bytes(teacher_html)
     with zipfile.ZipFile(io.BytesIO(word_bytes)) as document:
         assert "word/media/image1.png" in document.namelist()
         xml = document.read("word/document.xml").decode("utf-8")
+    visible_text = html.unescape(re.sub(r"<[^>]+>", "", xml))
     Document(io.BytesIO(word_bytes))
-    assert "Elev 1" in xml
-    assert "S 2024q" in xml
+    assert "Elev: Elev 1" in visible_text
+    assert "Klasse: 3.q" in visible_text
+    assert "<Elev 1>" not in visible_text and "<3.q>" not in visible_text
     assert "Dansk A" in xml and "Historie B" in xml
     first = schedule["students"].iloc[0]
     assert str(first["Vejleder 1"]) in xml
     assert str(first["Vejleder 2"]) in xml
     for placeholder in ("Elevnavn", "Fag1 og niveau", "Vejleder fag 1", "Fag2 og niveau", "Vejleder fag 2"):
         assert placeholder not in xml
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js kræves for at afprøve den indlejrede Word-generator")
+def test_sop_template_fields_follow_the_documented_replacement_rules(tmp_path, monkeypatch):
+    fields = [
+        "Elevnavn", "Klasse", "Fag1 og niveau", "Vejleder fag 1", "Fag2 og niveau", "Vejleder fag 2",
+    ]
+    template = Document()
+    template.add_paragraph("Elev: <Elevnavn> | Klasse: <Klasse> | " + " | ".join(f"<{field}>" for field in fields[2:]))
+    template_path = tmp_path / "SOP-SKABELON.docx"
+    template.save(template_path)
+    values = {
+        "Elevnavn": "Ane Andersen", "Klasse": "3.q", "Fag1 og niveau": "Dansk A",
+        "Vejleder fag 1": "Anna (ann)", "Fag2 og niveau": "Historie B", "Vejleder fag 2": "Bo (bo)",
+    }
+    completed = Document(io.BytesIO(app.replace_docx_placeholders(template_path.read_bytes(), values)))
+    completed_text = "\n".join(paragraph.text for paragraph in completed.paragraphs)
+    for field, value in values.items():
+        assert value in completed_text
+        assert f"<{field}>" not in completed_text
+        assert f"<{value}>" not in completed_text
+    assert "Klasse: 3.q" in completed_text
+
+    monkeypatch.setattr(app, "DEFAULT_TEMPLATE", template_path)
+    schedule, _ = make_beta_schedule([("a", "b")])
+    word_bytes = dynamic_word_bytes(beta.make_schedule_html_beta(schedule))
+    with zipfile.ZipFile(io.BytesIO(word_bytes)) as document:
+        xml = document.read("word/document.xml").decode("utf-8")
+    visible_text = html.unescape(re.sub(r"<[^>]+>", "", xml))
+    for field in fields:
+        assert f"<{field}>" not in visible_text
+    assert "Elev: Elev 1" in visible_text and "Klasse: 3.q" in visible_text
+    assert "<Elev 1>" not in visible_text and "<3.q>" not in visible_text
+    assert "Dansk A" in xml and "Historie B" in xml
+
+
+def test_sop_class_label_uses_the_pupil_facing_class_format():
+    assert app.sop_class_label("S 2024y", date(2026, 9, 17)) == "3.y"
+    assert app.sop_class_label("3.q", date(2026, 9, 17)) == "3.q"
 
 
 def test_batch_word_utility_reports_progress_for_each_planned_student():
@@ -418,10 +477,78 @@ def test_email_columns_are_parsed_and_known_teacher_addresses_are_filled():
     assert emails == {"hst": "hst@nextkbh.dk", "matr": "matr@nextkbh.dk"}
 
 
+def test_generic_email_column_is_used_as_the_students_teams_id():
+    student_frame = pd.DataFrame({
+        "Elevnavn": ["Ane"], "Klasse": ["3q"], "Fag 1": ["Dansk A"],
+        "Fag 2": ["Historie B"], "Email": ["NEXT1@EDU.NEXTKBH.DK"],
+    })
+    assert beta.parse_students_beta(student_frame)[0]["teams_email"] == "next1@edu.nextkbh.dk"
+
+    class UploadedSchedule:
+        name = "vejledningsplan.csv"
+
+        @staticmethod
+        def getvalue():
+            return (
+                "Elev,Klasse,Lærer 1,Fag 1,Lærer 2,Fag 2,Email\n"
+                "Ane,3q,hst,Dansk A,matr,Historie B,NEXT1@EDU.NEXTKBH.DK\n"
+            ).encode("utf-8")
+
+    parsed = beta.parse_schedule_upload_beta(UploadedSchedule())
+    assert parsed["students"][0]["teams_email"] == "next1@edu.nextkbh.dk"
+    assert {teacher["teams_email"] for teacher in parsed["teachers"]} == {
+        "hst@nextkbh.dk", "matr@nextkbh.dk",
+    }
+
+    schedule = beta.make_schedule_beta(
+        parsed["students"], parsed["teachers"], parsed["solution"],
+        clock(8, 15), clock(16, 15), 20, 0, 0, 0, True,
+        lunch_mode="Fast tidspunkt for alle lærere", lunch_start_time=clock(12), lunch_minutes=30,
+        search_attempts=5, teacher_blocks={}, floating_pauses=True,
+    )
+    teacher_html = beta.make_schedule_html_beta(schedule)
+    assert teacher_html.count('class="action action-teams"') == 2
+    assert "hst%40nextkbh.dk" in teacher_html
+    assert "matr%40nextkbh.dk" in teacher_html
+    assert "next1%40edu.nextkbh.dk" in teacher_html
+    assert 'class="action action-disabled" title="Teams-link' not in teacher_html
+
+
+def test_teams_action_stays_active_when_excel_table_is_on_a_later_sheet_after_title_rows():
+    excel = io.BytesIO()
+    plan = pd.DataFrame({
+        "Elev": ["Ane"], "Email": ["next27888@edu.nextkbh.dk"], "Klasse": ["S 2024q"],
+        "Lærer 1": ["Henrik Sterner (hst)"], "Fag 1": ["Dansk A"],
+        "Lærer 2": ["Mathias Ramberg (matr)"], "Fag 2": ["Historie B"],
+    })
+    with pd.ExcelWriter(excel, engine="openpyxl") as writer:
+        pd.DataFrame({"Information": ["Godkendt SOP-fordeling"]}).to_excel(writer, index=False, sheet_name="Læs mig")
+        plan.to_excel(writer, index=False, sheet_name="Vejledningsplan", startrow=2)
+
+    class UploadedExcel:
+        name = "godkendt-fordeling.xlsx"
+
+        @staticmethod
+        def getvalue():
+            return excel.getvalue()
+
+    parsed = beta.parse_schedule_upload_beta(UploadedExcel())
+    assert parsed["students"][0]["teams_email"] == "next27888@edu.nextkbh.dk"
+    schedule, _ = make_beta_schedule(
+        [("hst", "matr")], students_override=parsed["students"], teachers_override=parsed["teachers"],
+    )
+    teacher_html = beta.make_schedule_html_beta(schedule)
+    assert teacher_html.count('class="action action-teams"') == 2
+    assert re.search(r'<tr data-teacher="[^"]*hst[^"]*">.*class="action action-teams"', teacher_html)
+    assert "hst%40nextkbh.dk" in teacher_html
+    assert "matr%40nextkbh.dk" in teacher_html
+    assert "next27888%40edu.nextkbh.dk" in teacher_html
+
+
 def test_schedule_template_contains_teams_email_columns():
     workbook = load_workbook(io.BytesIO(beta.make_schedule_input_template_beta()), read_only=True)
     headers = [cell.value for cell in next(workbook["Tidsplan-input"].iter_rows())]
-    assert "Elev Teams-email" in headers
+    assert "Email" in headers
     assert "Lærer 1 Teams-email" in headers
     assert "Lærer 2 Teams-email" in headers
 
